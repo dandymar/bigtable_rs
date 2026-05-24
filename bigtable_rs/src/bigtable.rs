@@ -114,6 +114,7 @@ use googleapis_tonic_google_bigtable_v2::google::bigtable::v2::{
 };
 use googleapis_tonic_google_bigtable_v2::google::bigtable::v2::{
     CheckAndMutateRowRequest, CheckAndMutateRowResponse, ExecuteQueryRequest, ExecuteQueryResponse,
+    PrepareQueryRequest, PrepareQueryResponse,
 };
 
 pub mod read_rows;
@@ -571,12 +572,110 @@ impl BigTable {
         Ok(response)
     }
 
-    /// Wrapped `execute_query` method
+    /// Wrapped `execute_query` method with transparent Prepared Query coercion.
+    ///
+    /// If `request.query` is not empty (direct SQL parameter invocation), the client library
+    /// will automatically intercept it, run a unary `PrepareQuery` RPC to compile the plan
+    /// on the coprocessor, swap the SQL parameter with the returned opaque plan token bytes,
+    /// and stream back results, requiring zero changes in the user's application code.
     pub async fn execute_query(
         &mut self,
-        request: ExecuteQueryRequest,
+        mut request: ExecuteQueryRequest,
     ) -> Result<Streaming<ExecuteQueryResponse>> {
         let app_profile_id = request.app_profile_id.clone();
+
+        // Intercept direct SQL queries and transparently compile them
+        if !request.query.is_empty() {
+            log::info!(
+                "Coercing raw SQL query '{}' using PrepareQuery API to offload planning to coprocessor", 
+                request.query
+            );
+
+            let instance_name = self.instance_prefix.to_string(); // PrepareQuery requires projects/<p>/instances/<i>
+            let query = request.query.clone();
+
+            // Map data format choices from execute_query_request into prepare_query_request
+            use googleapis_tonic_google_bigtable_v2::google::bigtable::v2::execute_query_request::DataFormat as ExecFormat;
+            use googleapis_tonic_google_bigtable_v2::google::bigtable::v2::prepare_query_request::DataFormat as PrepFormat;
+
+            let data_format = match &request.data_format {
+                Some(ExecFormat::ProtoFormat(fmt)) => Some(PrepFormat::ProtoFormat(fmt.clone())),
+                _ => None,
+            };
+
+            // Extract type descriptors from mapping values to construct the plan parameter type map
+            use googleapis_tonic_google_bigtable_v2::google::bigtable::v2::Type;
+            use googleapis_tonic_google_bigtable_v2::google::bigtable::v2::value::Kind;
+            use googleapis_tonic_google_bigtable_v2::google::bigtable::v2::r#type::Kind as TypeKind;
+            let mut param_types = std::collections::HashMap::new();
+
+            for (param_name, value) in &request.params {
+                if let Some(val_type) = &value.r#type {
+                    param_types.insert(param_name.clone(), val_type.clone());
+                } else {
+                    let inferred_type = match &value.kind {
+                        Some(Kind::BytesValue(_)) | Some(Kind::RawValue(_)) => Some(Type {
+                            kind: Some(TypeKind::BytesType(Default::default())),
+                        }),
+                        Some(Kind::StringValue(_)) => Some(Type {
+                            kind: Some(TypeKind::StringType(Default::default())),
+                        }),
+                        Some(Kind::IntValue(_)) | Some(Kind::RawTimestampMicros(_)) => Some(Type {
+                            kind: Some(TypeKind::Int64Type(Default::default())),
+                        }),
+                        Some(Kind::BoolValue(_)) => Some(Type {
+                            kind: Some(TypeKind::BoolType(Default::default())),
+                        }),
+                        Some(Kind::FloatValue(_)) => Some(Type {
+                            kind: Some(TypeKind::Float64Type(Default::default())),
+                        }),
+                        Some(Kind::TimestampValue(_)) => Some(Type {
+                            kind: Some(TypeKind::TimestampType(Default::default())),
+                        }),
+                        Some(Kind::DateValue(_)) => Some(Type {
+                            kind: Some(TypeKind::DateType(Default::default())),
+                        }),
+                        _ => None,
+                    };
+
+                    if let Some(t) = inferred_type {
+                        param_types.insert(param_name.clone(), t);
+                    }
+                }
+            }
+
+            let prepare_request = PrepareQueryRequest {
+                instance_name: instance_name.clone(),
+                app_profile_id: app_profile_id.clone(),
+                query,
+                data_format,
+                param_types,
+                ..Default::default()
+            };
+
+            let mut prep_tonic_req = prepare_request.into_request();
+            prep_tonic_req.metadata_mut().insert(
+                "x-goog-request-params",
+                MetadataValue::from_str(&format!(
+                    "name={}&app_profile_id={}",
+                    self.instance_prefix, app_profile_id
+                ))
+                .map_err(Error::MetadataError)?,
+            );
+
+            // Execute the unary compilation RPC call
+            let prepare_response = self
+                .client
+                .prepare_query(prep_tonic_req)
+                .await?
+                .into_inner();
+
+            // Overwrite the request parameters with the compiled plan token
+            request.prepared_query = prepare_response.prepared_query;
+            request.query.clear();
+            request.data_format = None;
+        }
+
         let mut tonic_req: tonic::Request<_> = request.into_request();
         // Add x-goog-request-params header with routing options, without those the call fails.
         tonic_req.metadata_mut().insert(
@@ -588,6 +687,26 @@ impl BigTable {
             .map_err(Error::MetadataError)?,
         );
         let response = self.client.execute_query(tonic_req).await?.into_inner();
+        Ok(response)
+    }
+
+    /// Wrapped `prepare_query` method to support Phase 2 migration.
+    /// Allows client applications to explicitly pre-compile and cache query plans.
+    pub async fn prepare_query(
+        &mut self,
+        request: PrepareQueryRequest,
+    ) -> Result<PrepareQueryResponse> {
+        let app_profile_id = request.app_profile_id.clone();
+        let mut tonic_req = request.into_request();
+        tonic_req.metadata_mut().insert(
+            "x-goog-request-params",
+            MetadataValue::from_str(&format!(
+                "name={}&app_profile_id={}",
+                self.instance_prefix, app_profile_id
+            ))
+            .map_err(Error::MetadataError)?,
+        );
+        let response = self.client.prepare_query(tonic_req).await?.into_inner();
         Ok(response)
     }
 

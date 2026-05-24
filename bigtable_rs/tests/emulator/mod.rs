@@ -446,3 +446,219 @@ async fn test_read_nonexistent_row() {
     let rows = response.unwrap();
     assert!(rows.is_empty(), "Expected no rows for nonexistent key");
 }
+
+#[tokio::test]
+#[ignore = "The local Bigtable emulator does not currently support PrepareQuery"]
+async fn test_prepare_and_execute_query_caching_flow() {
+    global_setup().await;
+
+    let connection: BigTableConnection = create_connection(false).await.expect("Failed to connect");
+    let mut bigtable = connection.client();
+    let instance_name = format!("projects/{}/instances/{}", PROJECT_ID, INSTANCE_NAME);
+
+    let test_key = format!("sql_cache_key_{}", std::process::id()).into_bytes();
+
+    // 1. Write cell data
+    let mutate_request = MutateRowRequest {
+        table_name: bigtable.get_full_table_name(TABLE_NAME),
+        row_key: test_key.clone(),
+        mutations: vec![Mutation {
+            mutation: Some(mutation::Mutation::SetCell(SetCell {
+                family_name: CF1.to_string(),
+                column_qualifier: "col".to_owned().into_bytes(),
+                timestamp_micros: 1000,
+                value: "val".to_owned().into_bytes(),
+            })),
+        }],
+        ..Default::default()
+    };
+    bigtable.mutate_row(mutate_request).await.expect("Failed to write cell");
+
+    // 2. Prepare the query on the coprocessor
+    use googleapis_tonic_google_bigtable_v2::google::bigtable::v2::PrepareQueryRequest;
+    use googleapis_tonic_google_bigtable_v2::google::bigtable::v2::Type;
+    use googleapis_tonic_google_bigtable_v2::google::bigtable::v2::r#type::Kind as TypeKind;
+
+    let mut param_types = HashMap::new();
+    param_types.insert(
+        "target_key".to_string(),
+        Type {
+            kind: Some(TypeKind::BytesType(Default::default())),
+        },
+    );
+
+    let prep_request = PrepareQueryRequest {
+        instance_name: instance_name.clone(),
+        query: r#"SELECT _key FROM "table-1" WHERE _key = @target_key"#.to_string(),
+        param_types,
+        ..Default::default()
+    };
+
+    let prep_response = bigtable.prepare_query(prep_request).await.expect("Failed to prepare query");
+    let plan_token = prep_response.prepared_query;
+    assert!(!plan_token.is_empty(), "Returned plan token bytes must not be empty");
+
+    // 3. Execute using the pre-compiled plan token
+    use googleapis_tonic_google_bigtable_v2::google::bigtable::v2::ExecuteQueryRequest;
+    use googleapis_tonic_google_bigtable_v2::google::bigtable::v2::Value;
+    use googleapis_tonic_google_bigtable_v2::google::bigtable::v2::value::Kind as ValKind;
+
+    let mut params = HashMap::new();
+    params.insert(
+        "target_key".to_string(),
+        Value {
+            kind: Some(ValKind::BytesValue(test_key.clone())),
+            r#type: None,
+        },
+    );
+
+    let exec_request = ExecuteQueryRequest {
+        instance_name: instance_name.clone(),
+        prepared_query: plan_token,
+        params,
+        ..Default::default()
+    };
+
+    let stream_response = bigtable.execute_query(exec_request).await.expect("Failed to execute prepared query");
+
+    // 4. Buffer bytes and parse ProtoRows stream
+    use googleapis_tonic_google_bigtable_v2::google::bigtable::v2::execute_query_response::Response as ExecResponse;
+    use googleapis_tonic_google_bigtable_v2::google::bigtable::v2::partial_result_set::PartialRows;
+    use googleapis_tonic_google_bigtable_v2::google::bigtable::v2::ProtoRows;
+    use prost::Message;
+
+    let mut stream = stream_response;
+    let mut buffered_bytes = Vec::new();
+
+    while let Some(res) = stream.try_next().await.expect("Error in streaming response") {
+        if let Some(resp_variant) = res.response {
+            match resp_variant {
+                ExecResponse::Results(partial_set) => {
+                    if let Some(rows_variant) = partial_set.partial_rows {
+                        match rows_variant {
+                            PartialRows::ProtoRowsBatch(batch) => {
+                                buffered_bytes.extend_from_slice(&batch.batch_data);
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let proto_rows = ProtoRows::decode(buffered_bytes.as_slice()).expect("Failed to parse ProtoRows binary batch");
+    let keys: Vec<Vec<u8>> = proto_rows
+        .values
+        .into_iter()
+        .map(|val| match val.kind {
+            Some(ValKind::BytesValue(b)) => b,
+            _ => vec![],
+        })
+        .collect();
+
+    assert!(
+        keys.contains(&test_key),
+        "Expected query key {:?} not found in result set keys {:?}",
+        test_key,
+        keys
+    );
+}
+
+#[tokio::test]
+#[ignore = "The local Bigtable emulator does not currently support PrepareQuery"]
+async fn test_execute_query_transparent_coercion() {
+    global_setup().await;
+
+    let connection: BigTableConnection = create_connection(false).await.expect("Failed to connect");
+    let mut bigtable = connection.client();
+    let instance_name = format!("projects/{}/instances/{}", PROJECT_ID, INSTANCE_NAME);
+
+    let test_key = format!("sql_coerce_key_{}", std::process::id()).into_bytes();
+
+    // 1. Write cell data
+    let mutate_request = MutateRowRequest {
+        table_name: bigtable.get_full_table_name(TABLE_NAME),
+        row_key: test_key.clone(),
+        mutations: vec![Mutation {
+            mutation: Some(mutation::Mutation::SetCell(SetCell {
+                family_name: CF1.to_string(),
+                column_qualifier: "col".to_owned().into_bytes(),
+                timestamp_micros: 1000,
+                value: "val".to_owned().into_bytes(),
+            })),
+        }],
+        ..Default::default()
+    };
+    bigtable.mutate_row(mutate_request).await.expect("Failed to write cell");
+
+    // 2. Execute SQL query passing direct SQL string with parameterized bindings
+    use googleapis_tonic_google_bigtable_v2::google::bigtable::v2::ExecuteQueryRequest;
+    use googleapis_tonic_google_bigtable_v2::google::bigtable::v2::Value;
+    use googleapis_tonic_google_bigtable_v2::google::bigtable::v2::value::Kind as ValKind;
+    use googleapis_tonic_google_bigtable_v2::google::bigtable::v2::execute_query_request::DataFormat;
+    use googleapis_tonic_google_bigtable_v2::google::bigtable::v2::ProtoFormat;
+
+    let mut params = HashMap::new();
+    params.insert(
+        "target_key".to_string(),
+        Value {
+            kind: Some(ValKind::BytesValue(test_key.clone())),
+            r#type: None, // Type left empty: tests library type-inference coercion!
+        },
+    );
+
+    let legacy_request = ExecuteQueryRequest {
+        instance_name: instance_name.clone(),
+        query: r#"SELECT _key FROM "table-1" WHERE _key = @target_key"#.to_string(),
+        data_format: Some(DataFormat::ProtoFormat(ProtoFormat::default())),
+        params,
+        ..Default::default()
+    };
+
+    // Library transparently intercepts direct SQL, compiles on the server, type infers, and executes
+    let stream_response = bigtable.execute_query(legacy_request).await.expect("Coerced execution failed");
+
+    // 3. Verify stream returns matching data
+    use googleapis_tonic_google_bigtable_v2::google::bigtable::v2::execute_query_response::Response as ExecResponse;
+    use googleapis_tonic_google_bigtable_v2::google::bigtable::v2::partial_result_set::PartialRows;
+    use googleapis_tonic_google_bigtable_v2::google::bigtable::v2::ProtoRows;
+    use prost::Message;
+
+    let mut stream = stream_response;
+    let mut buffered_bytes = Vec::new();
+
+    while let Some(res) = stream.try_next().await.expect("Error in coerced streaming") {
+        if let Some(resp_variant) = res.response {
+            match resp_variant {
+                ExecResponse::Results(partial_set) => {
+                    if let Some(rows_variant) = partial_set.partial_rows {
+                        match rows_variant {
+                            PartialRows::ProtoRowsBatch(batch) => {
+                                buffered_bytes.extend_from_slice(&batch.batch_data);
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let proto_rows = ProtoRows::decode(buffered_bytes.as_slice()).expect("Failed to parse coerced results");
+    let keys: Vec<Vec<u8>> = proto_rows
+        .values
+        .into_iter()
+        .map(|val| match val.kind {
+            Some(ValKind::BytesValue(b)) => b,
+            _ => vec![],
+        })
+        .collect();
+
+    assert!(
+        keys.contains(&test_key),
+        "Expected coerced key {:?} not found in returned list {:?}",
+        test_key,
+        keys
+    );
+}
