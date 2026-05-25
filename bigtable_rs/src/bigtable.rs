@@ -419,11 +419,15 @@ impl BigTableConnection {
     /// Clients require `&mut self`, due to `Tonic::transport::Channel` limitations, however
     /// the created new clients can be cheaply cloned and thus can be send to different threads
     pub fn client(&self) -> BigTable {
+        let env_override = std::env::var("BIGTABLE_RUST_DISABLE_SQL_PREPARE_IN_EXECUTE")
+            .unwrap_or_default() == "true";
+
         BigTable {
             client: self.client.clone(),
             instance_prefix: self.instance_prefix.clone(),
             table_prefix: self.table_prefix.clone(),
             timeout: self.timeout.clone(),
+            execute_query_with_prepare_disabled: env_override,
         }
     }
 
@@ -479,9 +483,19 @@ pub struct BigTable {
     instance_prefix: Arc<String>,
     table_prefix: Arc<String>,
     timeout: Arc<Option<Duration>>,
+    execute_query_with_prepare_disabled: bool,
 }
 
 impl BigTable {
+    /// Configure whether execute_query automatically prepares plans first.
+    ///
+    /// Defaults to false (automatic pre-compilation active by default).
+    /// Pass true to disable and globally bypass preparation, forcing all direct SQL queries
+    /// to execute legacy-style directly on the database gateway.
+    pub fn set_execute_query_with_prepare_disabled(&mut self, disabled: bool) {
+        self.execute_query_with_prepare_disabled = disabled;
+    }
+
     /// Wrapped `check_and_mutate_row` method
     pub async fn check_and_mutate_row(
         &mut self,
@@ -584,67 +598,68 @@ impl BigTable {
     ) -> Result<Streaming<ExecuteQueryResponse>> {
         let app_profile_id = request.app_profile_id.clone();
 
-        // Intercept direct SQL queries and transparently compile them
-        if !request.query.is_empty() {
-            log::info!(
-                "Coercing raw SQL query '{}' using PrepareQuery API to offload planning to coprocessor", 
-                request.query
-            );
+        // Transparent Prepared Query coercion bypass check
+        if !self.execute_query_with_prepare_disabled {
+            if !request.query.is_empty() {
+                log::info!(
+                    "Coercing raw SQL query '{}' using PrepareQuery API to offload planning to coprocessor", 
+                    request.query
+                );
 
-            let instance_name = self.instance_prefix.to_string(); // PrepareQuery requires projects/<p>/instances/<i>
-            let query = request.query.clone();
+                let instance_name = self.instance_prefix.to_string(); // PrepareQuery requires projects/<p>/instances/<i>
+                let query = request.query.clone();
 
-            // Map data format choices from execute_query_request into prepare_query_request
-            use googleapis_tonic_google_bigtable_v2::google::bigtable::v2::execute_query_request::DataFormat as ExecFormat;
-            use googleapis_tonic_google_bigtable_v2::google::bigtable::v2::prepare_query_request::DataFormat as PrepFormat;
+                // Map data format choices from execute_query_request into prepare_query_request
+                use googleapis_tonic_google_bigtable_v2::google::bigtable::v2::execute_query_request::DataFormat as ExecFormat;
+                use googleapis_tonic_google_bigtable_v2::google::bigtable::v2::prepare_query_request::DataFormat as PrepFormat;
 
-            let data_format = match &request.data_format {
-                Some(ExecFormat::ProtoFormat(fmt)) => Some(PrepFormat::ProtoFormat(fmt.clone())),
-                _ => None,
-            };
+                let data_format = match &request.data_format {
+                    Some(ExecFormat::ProtoFormat(fmt)) => Some(PrepFormat::ProtoFormat(fmt.clone())),
+                    _ => None,
+                };
 
-            // Extract type descriptors from mapping values to construct the plan parameter type map
+                // Extract type descriptors from mapping values to construct the plan parameter type map
+                let mut param_types = std::collections::HashMap::new();
 
-            let mut param_types = std::collections::HashMap::new();
-
-            for (param_name, value) in &request.params {
-                if let Some(val_type) = &value.r#type {
-                    param_types.insert(param_name.clone(), val_type.clone());
-                } else if let Some(t) = infer_type_from_value(value) {
-                    param_types.insert(param_name.clone(), t);
+                for (param_name, value) in &request.params {
+                    if let Some(val_type) = &value.r#type {
+                        param_types.insert(param_name.clone(), val_type.clone());
+                    } else if let Some(t) = infer_type_from_value(value) {
+                        param_types.insert(param_name.clone(), t);
+                    }
                 }
+
+                let prepare_request = PrepareQueryRequest {
+                    instance_name: instance_name.clone(),
+                    app_profile_id: app_profile_id.clone(),
+                    query,
+                    data_format,
+                    param_types,
+                    ..Default::default()
+                };
+
+                let mut prep_tonic_req = prepare_request.into_request();
+                prep_tonic_req.metadata_mut().insert(
+                    "x-goog-request-params",
+                    MetadataValue::from_str(&format!(
+                        "name={}&app_profile_id={}",
+                        self.instance_prefix, app_profile_id
+                    ))
+                    .map_err(Error::MetadataError)?,
+                );
+
+                // Execute the unary compilation RPC call
+                let prepare_response = self
+                    .client
+                    .prepare_query(prep_tonic_req)
+                    .await?
+                    .into_inner();
+
+                // Overwrite the request parameters with the compiled plan token
+                request.prepared_query = prepare_response.prepared_query;
+                request.query.clear();
+                request.data_format = None;
             }
-
-            let prepare_request = PrepareQueryRequest {
-                instance_name: instance_name.clone(),
-                app_profile_id: app_profile_id.clone(),
-                query,
-                data_format,
-                param_types,
-                ..Default::default()
-            };
-
-            let mut prep_tonic_req = prepare_request.into_request();
-            prep_tonic_req.metadata_mut().insert(
-                "x-goog-request-params",
-                MetadataValue::from_str(&format!(
-                    "name={}&app_profile_id={}",
-                    self.instance_prefix, app_profile_id
-                ))
-                .map_err(Error::MetadataError)?,
-            );
-
-            // Execute the unary compilation RPC call
-            let prepare_response = self
-                .client
-                .prepare_query(prep_tonic_req)
-                .await?
-                .into_inner();
-
-            // Overwrite the request parameters with the compiled plan token
-            request.prepared_query = prepare_response.prepared_query;
-            request.query.clear();
-            request.data_format = None;
         }
 
         let mut tonic_req: tonic::Request<_> = request.into_request();

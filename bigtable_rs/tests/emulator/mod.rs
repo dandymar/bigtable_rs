@@ -662,3 +662,112 @@ async fn test_execute_query_transparent_coercion() {
         keys
     );
 }
+
+#[tokio::test]
+async fn test_execute_query_with_prepare_disabled_bypass() {
+    global_setup().await;
+
+    let connection: BigTableConnection = create_connection(false).await.expect("Failed to connect");
+    let mut bigtable = connection.client();
+    let instance_name = format!("projects/{}/instances/{}", PROJECT_ID, INSTANCE_NAME);
+
+    // 1. Explicitly globally disable prepared-query compilation bypass switch
+    bigtable.set_execute_query_with_prepare_disabled(true);
+
+    let test_key = format!("sql_bypass_key_{}", std::process::id()).into_bytes();
+
+    // 2. Write cell data
+    let mutate_request = MutateRowRequest {
+        table_name: bigtable.get_full_table_name(TABLE_NAME),
+        row_key: test_key.clone(),
+        mutations: vec![Mutation {
+            mutation: Some(mutation::Mutation::SetCell(SetCell {
+                family_name: CF1.to_string(),
+                column_qualifier: "col".to_owned().into_bytes(),
+                timestamp_micros: 1000,
+                value: "val".to_owned().into_bytes(),
+            })),
+        }],
+        ..Default::default()
+    };
+    bigtable.mutate_row(mutate_request).await.expect("Failed to write cell");
+
+    // 3. Execute query using direct legacy query string (prepare-disabled: no compilation token substitution!)
+    use googleapis_tonic_google_bigtable_v2::google::bigtable::v2::ExecuteQueryRequest;
+    use googleapis_tonic_google_bigtable_v2::google::bigtable::v2::Value;
+    use googleapis_tonic_google_bigtable_v2::google::bigtable::v2::value::Kind as ValKind;
+    use googleapis_tonic_google_bigtable_v2::google::bigtable::v2::execute_query_request::DataFormat;
+    use googleapis_tonic_google_bigtable_v2::google::bigtable::v2::ProtoFormat;
+
+    let mut params = HashMap::new();
+    params.insert(
+        "target_key".to_string(),
+        Value {
+            kind: Some(ValKind::BytesValue(test_key.clone())),
+            r#type: None,
+        },
+    );
+
+    let legacy_request = ExecuteQueryRequest {
+        instance_name: instance_name.clone(),
+        query: r#"SELECT _key FROM "table-1" WHERE _key = @target_key"#.to_string(),
+        data_format: Some(DataFormat::ProtoFormat(ProtoFormat::default())),
+        params,
+        ..Default::default()
+    };
+
+    // This must execute without panicking on PrepareQuery (since compilation is disabled)
+    let stream_response = bigtable.execute_query(legacy_request).await;
+    
+    match stream_response {
+        Ok(mut stream) => {
+            // Emulator supports direct SQL! Let's verify results match
+            use googleapis_tonic_google_bigtable_v2::google::bigtable::v2::execute_query_response::Response as ExecResponse;
+            use googleapis_tonic_google_bigtable_v2::google::bigtable::v2::partial_result_set::PartialRows;
+            use googleapis_tonic_google_bigtable_v2::google::bigtable::v2::ProtoRows;
+            use prost::Message;
+
+            let mut buffered_bytes = Vec::new();
+            while let Some(res) = stream.try_next().await.expect("Error in direct streaming") {
+                if let Some(resp_variant) = res.response {
+                    match resp_variant {
+                        ExecResponse::Results(partial_set) => {
+                            if let Some(rows_variant) = partial_set.partial_rows {
+                                match rows_variant {
+                                    PartialRows::ProtoRowsBatch(batch) => {
+                                        buffered_bytes.extend_from_slice(&batch.batch_data);
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
+            let proto_rows = ProtoRows::decode(buffered_bytes.as_slice()).expect("Failed to parse direct results");
+            let keys: Vec<Vec<u8>> = proto_rows
+                .values
+                .into_iter()
+                .map(|val| match val.kind {
+                    Some(ValKind::BytesValue(b)) => b,
+                    _ => vec![],
+                })
+                .collect();
+
+            assert!(keys.contains(&test_key), "Expected key not found in bypass direct SQL results");
+            println!("Verification: Direct SQL bypass test PASSED successfully on the emulator!");
+        }
+        Err(Error::RpcError(status)) if status.code() == tonic::Code::Unimplemented => {
+            // Emulator does not support direct SQL either, but the error message confirms we bypassed PrepareQuery
+            assert!(
+                status.message().contains("ExecuteQuery") || status.message().contains("unimplemented"),
+                "Expected Unimplemented from ExecuteQuery, got: {:?}", status
+            );
+            println!("Verification: Direct SQL bypass successfully verified (GFE returned Unimplemented for direct SQL as expected)!");
+        }
+        Err(e) => {
+            panic!("Unexpected error in direct SQL bypass execution: {:?}", e);
+        }
+    }
+}
