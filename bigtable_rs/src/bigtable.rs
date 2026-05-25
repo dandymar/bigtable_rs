@@ -604,43 +604,14 @@ impl BigTable {
             };
 
             // Extract type descriptors from mapping values to construct the plan parameter type map
-            use googleapis_tonic_google_bigtable_v2::google::bigtable::v2::Type;
-            use googleapis_tonic_google_bigtable_v2::google::bigtable::v2::value::Kind;
-            use googleapis_tonic_google_bigtable_v2::google::bigtable::v2::r#type::Kind as TypeKind;
+
             let mut param_types = std::collections::HashMap::new();
 
             for (param_name, value) in &request.params {
                 if let Some(val_type) = &value.r#type {
                     param_types.insert(param_name.clone(), val_type.clone());
-                } else {
-                    let inferred_type = match &value.kind {
-                        Some(Kind::BytesValue(_)) | Some(Kind::RawValue(_)) => Some(Type {
-                            kind: Some(TypeKind::BytesType(Default::default())),
-                        }),
-                        Some(Kind::StringValue(_)) => Some(Type {
-                            kind: Some(TypeKind::StringType(Default::default())),
-                        }),
-                        Some(Kind::IntValue(_)) | Some(Kind::RawTimestampMicros(_)) => Some(Type {
-                            kind: Some(TypeKind::Int64Type(Default::default())),
-                        }),
-                        Some(Kind::BoolValue(_)) => Some(Type {
-                            kind: Some(TypeKind::BoolType(Default::default())),
-                        }),
-                        Some(Kind::FloatValue(_)) => Some(Type {
-                            kind: Some(TypeKind::Float64Type(Default::default())),
-                        }),
-                        Some(Kind::TimestampValue(_)) => Some(Type {
-                            kind: Some(TypeKind::TimestampType(Default::default())),
-                        }),
-                        Some(Kind::DateValue(_)) => Some(Type {
-                            kind: Some(TypeKind::DateType(Default::default())),
-                        }),
-                        _ => None,
-                    };
-
-                    if let Some(t) = inferred_type {
-                        param_types.insert(param_name.clone(), t);
-                    }
+                } else if let Some(t) = infer_type_from_value(value) {
+                    param_types.insert(param_name.clone(), t);
                 }
             }
 
@@ -727,5 +698,108 @@ impl BigTable {
     /// Provide a convenient method to get full table, which can be used for building requests
     pub fn get_full_table_name(&self, table_name: &str) -> String {
         [&self.table_prefix, table_name].concat()
+    }
+}
+
+/// Internal helper to dynamically infer standard SQL Type schemas from protobuf Values.
+/// This is used by the transparent SQL coercion pipeline.
+pub(crate) fn infer_type_from_value(
+    value: &googleapis_tonic_google_bigtable_v2::google::bigtable::v2::Value,
+) -> Option<googleapis_tonic_google_bigtable_v2::google::bigtable::v2::Type> {
+    use googleapis_tonic_google_bigtable_v2::google::bigtable::v2::Type;
+    use googleapis_tonic_google_bigtable_v2::google::bigtable::v2::value::Kind;
+    use googleapis_tonic_google_bigtable_v2::google::bigtable::v2::r#type::Kind as TypeKind;
+
+    match &value.kind {
+        Some(Kind::BytesValue(_)) | Some(Kind::RawValue(_)) => Some(Type {
+            kind: Some(TypeKind::BytesType(Default::default())),
+        }),
+        Some(Kind::StringValue(_)) => Some(Type {
+            kind: Some(TypeKind::StringType(Default::default())),
+        }),
+        Some(Kind::IntValue(_)) | Some(Kind::RawTimestampMicros(_)) => Some(Type {
+            kind: Some(TypeKind::Int64Type(Default::default())),
+        }),
+        Some(Kind::BoolValue(_)) => Some(Type {
+            kind: Some(TypeKind::BoolType(Default::default())),
+        }),
+        Some(Kind::FloatValue(_)) => Some(Type {
+            kind: Some(TypeKind::Float64Type(Default::default())),
+        }),
+        Some(Kind::TimestampValue(_)) => Some(Type {
+            kind: Some(TypeKind::TimestampType(Default::default())),
+        }),
+        Some(Kind::DateValue(_)) => Some(Type {
+            kind: Some(TypeKind::DateType(Default::default())),
+        }),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use googleapis_tonic_google_bigtable_v2::google::bigtable::v2::value::Kind;
+    use googleapis_tonic_google_bigtable_v2::google::bigtable::v2::r#type::Kind as TypeKind;
+    use googleapis_tonic_google_bigtable_v2::google::bigtable::v2::Value;
+
+    #[test]
+    fn test_infer_type_from_bytes() {
+        let value = Value {
+            kind: Some(Kind::BytesValue(vec![1, 2, 3])),
+            ..Default::default()
+        };
+        let t = infer_type_from_value(&value).unwrap();
+        assert!(matches!(t.kind, Some(TypeKind::BytesType(_))));
+    }
+
+    #[test]
+    fn test_infer_type_from_string() {
+        let value = Value {
+            kind: Some(Kind::StringValue("hello".to_string())),
+            ..Default::default()
+        };
+        let t = infer_type_from_value(&value).unwrap();
+        assert!(matches!(t.kind, Some(TypeKind::StringType(_))));
+    }
+
+    #[test]
+    fn test_infer_type_from_int() {
+        let value = Value {
+            kind: Some(Kind::IntValue(42)),
+            ..Default::default()
+        };
+        let t = infer_type_from_value(&value).unwrap();
+        assert!(matches!(t.kind, Some(TypeKind::Int64Type(_))));
+    }
+
+    #[test]
+    fn test_infer_type_from_bool() {
+        let value = Value {
+            kind: Some(Kind::BoolValue(true)),
+            ..Default::default()
+        };
+        let t = infer_type_from_value(&value).unwrap();
+        assert!(matches!(t.kind, Some(TypeKind::BoolType(_))));
+    }
+
+    #[test]
+    fn test_infer_type_from_float() {
+        let value = Value {
+            kind: Some(Kind::FloatValue(3.14)),
+            ..Default::default()
+        };
+        let t = infer_type_from_value(&value).unwrap();
+        assert!(matches!(t.kind, Some(TypeKind::Float64Type(_))));
+    }
+
+    #[test]
+    fn test_infer_type_unspecified() {
+        let value = Value {
+            kind: None,
+            ..Default::default()
+        };
+        let t = infer_type_from_value(&value);
+        assert!(t.is_none());
     }
 }
