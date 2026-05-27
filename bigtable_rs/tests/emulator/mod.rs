@@ -472,12 +472,15 @@ async fn test_prepare_and_execute_query_caching_flow() {
         }],
         ..Default::default()
     };
-    bigtable.mutate_row(mutate_request).await.expect("Failed to write cell");
+    bigtable
+        .mutate_row(mutate_request)
+        .await
+        .expect("Failed to write cell");
 
     // 2. Prepare the query on the coprocessor
+    use googleapis_tonic_google_bigtable_v2::google::bigtable::v2::r#type::Kind as TypeKind;
     use googleapis_tonic_google_bigtable_v2::google::bigtable::v2::PrepareQueryRequest;
     use googleapis_tonic_google_bigtable_v2::google::bigtable::v2::Type;
-    use googleapis_tonic_google_bigtable_v2::google::bigtable::v2::r#type::Kind as TypeKind;
 
     let mut param_types = HashMap::new();
     param_types.insert(
@@ -494,14 +497,20 @@ async fn test_prepare_and_execute_query_caching_flow() {
         ..Default::default()
     };
 
-    let prep_response = bigtable.prepare_query(prep_request).await.expect("Failed to prepare query");
+    let prep_response = bigtable
+        .prepare_query(prep_request)
+        .await
+        .expect("Failed to prepare query");
     let plan_token = prep_response.prepared_query;
-    assert!(!plan_token.is_empty(), "Returned plan token bytes must not be empty");
+    assert!(
+        !plan_token.is_empty(),
+        "Returned plan token bytes must not be empty"
+    );
 
     // 3. Execute using the pre-compiled plan token
+    use googleapis_tonic_google_bigtable_v2::google::bigtable::v2::value::Kind as ValKind;
     use googleapis_tonic_google_bigtable_v2::google::bigtable::v2::ExecuteQueryRequest;
     use googleapis_tonic_google_bigtable_v2::google::bigtable::v2::Value;
-    use googleapis_tonic_google_bigtable_v2::google::bigtable::v2::value::Kind as ValKind;
 
     let mut params = HashMap::new();
     params.insert(
@@ -519,7 +528,10 @@ async fn test_prepare_and_execute_query_caching_flow() {
         ..Default::default()
     };
 
-    let stream_response = bigtable.execute_query(exec_request).await.expect("Failed to execute prepared query");
+    let stream_response = bigtable
+        .execute_query(exec_request)
+        .await
+        .expect("Failed to execute prepared query");
 
     // 4. Buffer bytes and parse ProtoRows stream
     use googleapis_tonic_google_bigtable_v2::google::bigtable::v2::execute_query_response::Response as ExecResponse;
@@ -530,7 +542,11 @@ async fn test_prepare_and_execute_query_caching_flow() {
     let mut stream = stream_response;
     let mut buffered_bytes = Vec::new();
 
-    while let Some(res) = stream.try_next().await.expect("Error in streaming response") {
+    while let Some(res) = stream
+        .try_next()
+        .await
+        .expect("Error in streaming response")
+    {
         if let Some(resp_variant) = res.response {
             match resp_variant {
                 ExecResponse::Results(partial_set) => {
@@ -547,7 +563,8 @@ async fn test_prepare_and_execute_query_caching_flow() {
         }
     }
 
-    let proto_rows = ProtoRows::decode(buffered_bytes.as_slice()).expect("Failed to parse ProtoRows binary batch");
+    let proto_rows = ProtoRows::decode(buffered_bytes.as_slice())
+        .expect("Failed to parse ProtoRows binary batch");
     let keys: Vec<Vec<u8>> = proto_rows
         .values
         .into_iter()
@@ -590,14 +607,17 @@ async fn test_execute_query_transparent_coercion() {
         }],
         ..Default::default()
     };
-    bigtable.mutate_row(mutate_request).await.expect("Failed to write cell");
+    bigtable
+        .mutate_row(mutate_request)
+        .await
+        .expect("Failed to write cell");
 
     // 2. Execute SQL query passing direct SQL string with parameterized bindings
-    use googleapis_tonic_google_bigtable_v2::google::bigtable::v2::ExecuteQueryRequest;
-    use googleapis_tonic_google_bigtable_v2::google::bigtable::v2::Value;
-    use googleapis_tonic_google_bigtable_v2::google::bigtable::v2::value::Kind as ValKind;
     use googleapis_tonic_google_bigtable_v2::google::bigtable::v2::execute_query_request::DataFormat;
+    use googleapis_tonic_google_bigtable_v2::google::bigtable::v2::value::Kind as ValKind;
+    use googleapis_tonic_google_bigtable_v2::google::bigtable::v2::ExecuteQueryRequest;
     use googleapis_tonic_google_bigtable_v2::google::bigtable::v2::ProtoFormat;
+    use googleapis_tonic_google_bigtable_v2::google::bigtable::v2::Value;
 
     let mut params = HashMap::new();
     params.insert(
@@ -617,7 +637,10 @@ async fn test_execute_query_transparent_coercion() {
     };
 
     // Library transparently intercepts direct SQL, compiles on the server, type infers, and executes
-    let stream_response = bigtable.execute_query(legacy_request).await.expect("Coerced execution failed");
+    let stream_response = bigtable
+        .execute_query(legacy_request)
+        .await
+        .expect("Coerced execution failed");
 
     // 3. Verify stream returns matching data
     use googleapis_tonic_google_bigtable_v2::google::bigtable::v2::execute_query_response::Response as ExecResponse;
@@ -645,7 +668,8 @@ async fn test_execute_query_transparent_coercion() {
         }
     }
 
-    let proto_rows = ProtoRows::decode(buffered_bytes.as_slice()).expect("Failed to parse coerced results");
+    let proto_rows =
+        ProtoRows::decode(buffered_bytes.as_slice()).expect("Failed to parse coerced results");
     let keys: Vec<Vec<u8>> = proto_rows
         .values
         .into_iter()
@@ -690,14 +714,17 @@ async fn test_execute_query_with_prepare_disabled_bypass() {
         }],
         ..Default::default()
     };
-    bigtable.mutate_row(mutate_request).await.expect("Failed to write cell");
+    bigtable
+        .mutate_row(mutate_request)
+        .await
+        .expect("Failed to write cell");
 
     // 3. Execute query using direct legacy query string (prepare-disabled: no compilation token substitution!)
-    use googleapis_tonic_google_bigtable_v2::google::bigtable::v2::ExecuteQueryRequest;
-    use googleapis_tonic_google_bigtable_v2::google::bigtable::v2::Value;
-    use googleapis_tonic_google_bigtable_v2::google::bigtable::v2::value::Kind as ValKind;
     use googleapis_tonic_google_bigtable_v2::google::bigtable::v2::execute_query_request::DataFormat;
+    use googleapis_tonic_google_bigtable_v2::google::bigtable::v2::value::Kind as ValKind;
+    use googleapis_tonic_google_bigtable_v2::google::bigtable::v2::ExecuteQueryRequest;
     use googleapis_tonic_google_bigtable_v2::google::bigtable::v2::ProtoFormat;
+    use googleapis_tonic_google_bigtable_v2::google::bigtable::v2::Value;
 
     let mut params = HashMap::new();
     params.insert(
@@ -718,7 +745,7 @@ async fn test_execute_query_with_prepare_disabled_bypass() {
 
     // This must execute without panicking on PrepareQuery (since compilation is disabled)
     let stream_response = bigtable.execute_query(legacy_request).await;
-    
+
     match stream_response {
         Ok(mut stream) => {
             // Emulator supports direct SQL! Let's verify results match
@@ -745,7 +772,8 @@ async fn test_execute_query_with_prepare_disabled_bypass() {
                 }
             }
 
-            let proto_rows = ProtoRows::decode(buffered_bytes.as_slice()).expect("Failed to parse direct results");
+            let proto_rows = ProtoRows::decode(buffered_bytes.as_slice())
+                .expect("Failed to parse direct results");
             let keys: Vec<Vec<u8>> = proto_rows
                 .values
                 .into_iter()
@@ -755,14 +783,19 @@ async fn test_execute_query_with_prepare_disabled_bypass() {
                 })
                 .collect();
 
-            assert!(keys.contains(&test_key), "Expected key not found in bypass direct SQL results");
+            assert!(
+                keys.contains(&test_key),
+                "Expected key not found in bypass direct SQL results"
+            );
             println!("Verification: Direct SQL bypass test PASSED successfully on the emulator!");
         }
         Err(Error::RpcError(status)) if status.code() == tonic::Code::Unimplemented => {
             // Emulator does not support direct SQL either, but the error message confirms we bypassed PrepareQuery
             assert!(
-                status.message().contains("ExecuteQuery") || status.message().contains("unimplemented"),
-                "Expected Unimplemented from ExecuteQuery, got: {:?}", status
+                status.message().contains("ExecuteQuery")
+                    || status.message().contains("unimplemented"),
+                "Expected Unimplemented from ExecuteQuery, got: {:?}",
+                status
             );
             println!("Verification: Direct SQL bypass successfully verified (GFE returned Unimplemented for direct SQL as expected)!");
         }

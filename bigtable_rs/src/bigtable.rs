@@ -118,6 +118,7 @@ use googleapis_tonic_google_bigtable_v2::google::bigtable::v2::{
 };
 
 pub mod read_rows;
+pub mod sql;
 
 /// An alias for Vec<u8> as row key
 type RowKey = Vec<u8>;
@@ -175,6 +176,9 @@ pub enum Error {
 
     #[error("Invalid metadata")]
     MetadataError(tonic::metadata::errors::InvalidMetadataValue),
+
+    #[error("Parameter type inference failed for field '{0}': {1}")]
+    ParameterTypeInferenceFailed(String, String),
 }
 
 impl std::convert::From<std::io::Error> for Error {
@@ -420,7 +424,8 @@ impl BigTableConnection {
     /// the created new clients can be cheaply cloned and thus can be send to different threads
     pub fn client(&self) -> BigTable {
         let env_override = std::env::var("BIGTABLE_RUST_DISABLE_SQL_PREPARE_IN_EXECUTE")
-            .unwrap_or_default() == "true";
+            .unwrap_or_default()
+            == "true";
 
         BigTable {
             client: self.client.clone(),
@@ -592,6 +597,7 @@ impl BigTable {
     /// will automatically intercept it, run a unary `PrepareQuery` RPC to compile the plan
     /// on the coprocessor, swap the SQL parameter with the returned opaque plan token bytes,
     /// and stream back results, requiring zero changes in the user's application code.
+    #[allow(deprecated)]
     pub async fn execute_query(
         &mut self,
         mut request: ExecuteQueryRequest,
@@ -599,24 +605,28 @@ impl BigTable {
         let app_profile_id = request.app_profile_id.clone();
 
         // Transparent Prepared Query coercion bypass check
-        if !self.execute_query_with_prepare_disabled {
-            if !request.query.is_empty() {
-                log::info!(
-                    "Coercing raw SQL query '{}' using PrepareQuery API to offload planning to coprocessor", 
-                    request.query
-                );
+        if !self.execute_query_with_prepare_disabled
+            && !request.query.is_empty()
+            && !request.params.is_empty()
+        {
+            log::info!(
+                "Coercing raw SQL query '{}' using PrepareQuery API to offload planning to coprocessor", 
+                request.query
+            );
 
-                let instance_name = self.instance_prefix.to_string(); // PrepareQuery requires projects/<p>/instances/<i>
-                let query = request.query.clone();
+            let instance_name = self.instance_prefix.to_string(); // PrepareQuery requires projects/<p>/instances/<i>
+            let query = request.query.clone();
 
-                // Map data format choices from execute_query_request into prepare_query_request
-                use googleapis_tonic_google_bigtable_v2::google::bigtable::v2::execute_query_request::DataFormat as ExecFormat;
-                use googleapis_tonic_google_bigtable_v2::google::bigtable::v2::prepare_query_request::DataFormat as PrepFormat;
+            // Map data format choices from execute_query_request into prepare_query_request
+            use googleapis_tonic_google_bigtable_v2::google::bigtable::v2::execute_query_request::DataFormat as ExecFormat;
+            use googleapis_tonic_google_bigtable_v2::google::bigtable::v2::prepare_query_request::DataFormat as PrepFormat;
 
-                let data_format = match &request.data_format {
-                    Some(ExecFormat::ProtoFormat(fmt)) => Some(PrepFormat::ProtoFormat(fmt.clone())),
-                    _ => None,
-                };
+            let data_format = match &request.data_format {
+                Some(ExecFormat::ProtoFormat(fmt)) => {
+                    Some(PrepFormat::ProtoFormat(*fmt))
+                }
+                _ => None,
+            };
 
                 // Extract type descriptors from mapping values to construct the plan parameter type map
                 let mut param_types = std::collections::HashMap::new();
@@ -624,8 +634,14 @@ impl BigTable {
                 for (param_name, value) in &request.params {
                     if let Some(val_type) = &value.r#type {
                         param_types.insert(param_name.clone(), val_type.clone());
-                    } else if let Some(t) = infer_type_from_value(value) {
-                        param_types.insert(param_name.clone(), t);
+                    } else {
+                        let inferred_type = infer_type_from_value(value).map_err(|e| match e {
+                            Error::ParameterTypeInferenceFailed(_, detail) => {
+                                Error::ParameterTypeInferenceFailed(param_name.clone(), detail)
+                            }
+                            other => other,
+                        })?;
+                        param_types.insert(param_name.clone(), inferred_type);
                     }
                 }
 
@@ -635,7 +651,6 @@ impl BigTable {
                     query,
                     data_format,
                     param_types,
-                    ..Default::default()
                 };
 
                 let mut prep_tonic_req = prepare_request.into_request();
@@ -660,7 +675,6 @@ impl BigTable {
                 request.query.clear();
                 request.data_format = None;
             }
-        }
 
         let mut tonic_req: tonic::Request<_> = request.into_request();
         // Add x-goog-request-params header with routing options, without those the call fails.
@@ -720,42 +734,57 @@ impl BigTable {
 /// This is used by the transparent SQL coercion pipeline.
 pub(crate) fn infer_type_from_value(
     value: &googleapis_tonic_google_bigtable_v2::google::bigtable::v2::Value,
-) -> Option<googleapis_tonic_google_bigtable_v2::google::bigtable::v2::Type> {
-    use googleapis_tonic_google_bigtable_v2::google::bigtable::v2::Type;
-    use googleapis_tonic_google_bigtable_v2::google::bigtable::v2::value::Kind;
+) -> std::result::Result<googleapis_tonic_google_bigtable_v2::google::bigtable::v2::Type, Error> {
     use googleapis_tonic_google_bigtable_v2::google::bigtable::v2::r#type::Kind as TypeKind;
+    use googleapis_tonic_google_bigtable_v2::google::bigtable::v2::value::Kind;
+    use googleapis_tonic_google_bigtable_v2::google::bigtable::v2::Type;
 
     match &value.kind {
-        Some(Kind::BytesValue(_)) | Some(Kind::RawValue(_)) => Some(Type {
+        // 1. Safeguard check: Block dynamic type mapping on Null/None value types:
+        None => Err(Error::ParameterTypeInferenceFailed(
+            "".to_owned(),
+            "Cannot infer type of Null/None value. Please specify the explicit schema mapping manually using .with_type(...)".to_owned()
+        )),
+
+        // 2. Safeguard check: Block dynamic type mapping on floats (avoid precision ambiguity):
+        Some(Kind::FloatValue(_)) => Err(Error::ParameterTypeInferenceFailed(
+            "".to_owned(),
+            "Cannot infer type of float. Please declare precision (either FLOAT32 or FLOAT64) manually using .with_type(...)".to_owned()
+        )),
+
+        // 3. Safeguard check: Block dynamic type mapping on Lists / Arrays / Structs:
+        Some(Kind::ArrayValue(_)) => Err(Error::ParameterTypeInferenceFailed(
+            "".to_owned(),
+            "Cannot infer type of ARRAY/STRUCT/MAP parameters. Please declare schema manually using .with_type(...)".to_owned()
+        )),
+
+        // 4. Stable primitive scalar mapping pathways:
+        Some(Kind::BytesValue(_)) | Some(Kind::RawValue(_)) => Ok(Type {
             kind: Some(TypeKind::BytesType(Default::default())),
         }),
-        Some(Kind::StringValue(_)) => Some(Type {
+        Some(Kind::StringValue(_)) => Ok(Type {
             kind: Some(TypeKind::StringType(Default::default())),
         }),
-        Some(Kind::IntValue(_)) | Some(Kind::RawTimestampMicros(_)) => Some(Type {
+        Some(Kind::IntValue(_)) | Some(Kind::RawTimestampMicros(_)) => Ok(Type {
             kind: Some(TypeKind::Int64Type(Default::default())),
         }),
-        Some(Kind::BoolValue(_)) => Some(Type {
+        Some(Kind::BoolValue(_)) => Ok(Type {
             kind: Some(TypeKind::BoolType(Default::default())),
         }),
-        Some(Kind::FloatValue(_)) => Some(Type {
-            kind: Some(TypeKind::Float64Type(Default::default())),
-        }),
-        Some(Kind::TimestampValue(_)) => Some(Type {
+        Some(Kind::TimestampValue(_)) => Ok(Type {
             kind: Some(TypeKind::TimestampType(Default::default())),
         }),
-        Some(Kind::DateValue(_)) => Some(Type {
+        Some(Kind::DateValue(_)) => Ok(Type {
             kind: Some(TypeKind::DateType(Default::default())),
         }),
-        _ => None,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use googleapis_tonic_google_bigtable_v2::google::bigtable::v2::value::Kind;
     use googleapis_tonic_google_bigtable_v2::google::bigtable::v2::r#type::Kind as TypeKind;
+    use googleapis_tonic_google_bigtable_v2::google::bigtable::v2::value::Kind;
     use googleapis_tonic_google_bigtable_v2::google::bigtable::v2::Value;
 
     #[test]
@@ -799,22 +828,30 @@ mod tests {
     }
 
     #[test]
-    fn test_infer_type_from_float() {
+    fn test_infer_type_from_float_rejection() {
         let value = Value {
-            kind: Some(Kind::FloatValue(3.14)),
+            kind: Some(Kind::FloatValue(123.45)),
             ..Default::default()
         };
-        let t = infer_type_from_value(&value).unwrap();
-        assert!(matches!(t.kind, Some(TypeKind::Float64Type(_))));
+        let t = infer_type_from_value(&value);
+        assert!(t.is_err());
+        assert!(matches!(
+            t.unwrap_err(),
+            Error::ParameterTypeInferenceFailed(_, detail) if detail.contains("float")
+        ));
     }
 
     #[test]
-    fn test_infer_type_unspecified() {
+    fn test_infer_type_unspecified_rejection() {
         let value = Value {
             kind: None,
             ..Default::default()
         };
         let t = infer_type_from_value(&value);
-        assert!(t.is_none());
+        assert!(t.is_err());
+        assert!(matches!(
+            t.unwrap_err(),
+            Error::ParameterTypeInferenceFailed(_, detail) if detail.contains("Null/None")
+        ));
     }
 }

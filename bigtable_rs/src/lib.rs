@@ -1,3 +1,5 @@
+#![allow(clippy::needless_return)]
+
 //!
 //! A simple Google Bigtable client.
 //!
