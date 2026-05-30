@@ -424,9 +424,9 @@ impl BigTableConnection {
     /// Clients require `&mut self`, due to `Tonic::transport::Channel` limitations, however
     /// the created new clients can be cheaply cloned and thus can be send to different threads
     pub fn client(&self) -> BigTable {
-        let prepare_disabled = std::env::var("BIGTABLE_RUST_ENABLE_SQL_PREPARE_IN_EXECUTE")
+        let prepare_disabled = std::env::var("BIGTABLE_RUST_DISABLE_SQL_PREPARE_IN_EXECUTE")
             .unwrap_or_default()
-            != "true";
+            == "true";
 
         BigTable {
             client: self.client.clone(),
