@@ -207,6 +207,7 @@ pub struct BigTableConnection {
     table_prefix: Arc<String>,
     instance_prefix: Arc<String>,
     timeout: Arc<Option<Duration>>,
+    pub(crate) statement_cache: Arc<prepared_statement::ClientStatementCache>,
 }
 
 impl BigTableConnection {
@@ -336,6 +337,7 @@ impl BigTableConnection {
                     table_prefix: Arc::new(table_prefix),
                     instance_prefix: Arc::new(instance_prefix),
                     timeout: Arc::new(timeout),
+                    statement_cache: Arc::new(prepared_statement::ClientStatementCache::new()),
                 })
             }
         }
@@ -416,6 +418,7 @@ impl BigTableConnection {
                 project_id, instance_name
             )),
             timeout: Arc::new(timeout),
+            statement_cache: Arc::new(prepared_statement::ClientStatementCache::new()),
         })
     }
 
@@ -434,6 +437,7 @@ impl BigTableConnection {
             table_prefix: self.table_prefix.clone(),
             timeout: self.timeout.clone(),
             execute_query_with_prepare_disabled: prepare_disabled,
+            statement_cache: self.statement_cache.clone(),
         }
     }
 
@@ -490,12 +494,24 @@ pub struct BigTable {
     pub(crate) table_prefix: Arc<String>,
     pub(crate) timeout: Arc<Option<Duration>>,
     pub(crate) execute_query_with_prepare_disabled: bool,
+    pub(crate) statement_cache: Arc<prepared_statement::ClientStatementCache>,
 }
 
 impl BigTable {
     /// Return the instance prefix name (projects/.../instances/...)
     pub fn instance_name(&self) -> &str {
         &self.instance_prefix
+    }
+
+    /// Returns a reference to the client-scoped statement cache registry
+    pub fn statement_cache(&self) -> &prepared_statement::ClientStatementCache {
+        &self.statement_cache
+    }
+
+    /// Returns a cloned Arc reference to the client-scoped statement cache registry (used inside tests)
+    #[doc(hidden)]
+    pub fn statement_cache_arc(&self) -> Arc<prepared_statement::ClientStatementCache> {
+        self.statement_cache.clone()
     }
 
     /// Configure whether execute_query automatically prepares plans first.
@@ -599,66 +615,104 @@ impl BigTable {
 
     /// Wrapped `execute_query` method with transparent Prepared Query coercion.
     ///
+    /// Wrapped `execute_query` method with transparent Prepared Query coercion and client-side caching.
+    ///
     /// If `request.query` is not empty (direct SQL parameter invocation), the client library
-    /// will automatically intercept it, run a unary `PrepareQuery` RPC to compile the plan
-    /// on the coprocessor, swap the SQL parameter with the returned opaque plan token bytes,
-    /// and stream back results, requiring zero changes in the user's application code.
+    /// will automatically intercept it, check the client-scoped cache, prepare if needed,
+    /// and execute, requiring zero changes in the user's application code.
     #[allow(deprecated)]
     pub async fn execute_query(
         &mut self,
         mut request: ExecuteQueryRequest,
     ) -> Result<Streaming<ExecuteQueryResponse>> {
         let app_profile_id = request.app_profile_id.clone();
+        let mut cached_stmt: Option<Arc<prepared_statement::PreparedStatementInner>> = None;
 
-        // Transparent Prepared Query coercion bypass check
+        // Case 2-A: Raw Query Execution (Bypass Coercion check / Use Case B)
         if !self.execute_query_with_prepare_disabled
             && !request.query.is_empty()
             && !request.params.is_empty()
+            && request.prepared_query.is_empty()
         {
             log::info!(
-                "Coercing raw SQL query '{}' using PrepareQuery API to offload planning to coprocessor", 
+                "Coercing raw SQL query '{}' using PrepareQuery API with transparent caching",
                 request.query
             );
 
-            let instance_name = self.instance_prefix.to_string(); // PrepareQuery requires projects/<p>/instances/<i>
-            let query = request.query.clone();
+            // 1. Infer parameter types from request params
+            let mut param_types = std::collections::HashMap::new();
+            for (param_name, value) in &request.params {
+                let pb_type = if let Some(val_type) = &value.r#type {
+                    val_type.clone()
+                } else {
+                    infer_type_from_value(value).unwrap_or_else(|_| {
+                        googleapis_tonic_google_bigtable_v2::google::bigtable::v2::Type {
+                            kind: Some(googleapis_tonic_google_bigtable_v2::google::bigtable::v2::r#type::Kind::StringType(
+                                Default::default(),
+                            )),
+                        }
+                    })
+                };
+                param_types.insert(param_name.clone(), pb_type);
+            }
 
-            // Map data format choices from execute_query_request into prepare_query_request
-            use googleapis_tonic_google_bigtable_v2::google::bigtable::v2::execute_query_request::DataFormat as ExecFormat;
-            use googleapis_tonic_google_bigtable_v2::google::bigtable::v2::prepare_query_request::DataFormat as PrepFormat;
-
-            let data_format = match &request.data_format {
-                Some(ExecFormat::ProtoFormat(fmt)) => Some(PrepFormat::ProtoFormat(*fmt)),
-                _ => None,
+            let prepare_req = PrepareQueryRequest {
+                instance_name: self.instance_prefix.to_string(),
+                app_profile_id: app_profile_id.clone(),
+                query: request.query.clone(),
+                param_types,
+                ..Default::default()
             };
 
-            // Extract type descriptors from mapping values to construct the plan parameter type map
-            let mut param_types = std::collections::HashMap::new();
+            // 2. Delegate to prepare_query under the hood (handles centralized caching)
+            let prepare_resp = self.prepare_query(prepare_req).await?;
 
-            for (param_name, value) in &request.params {
-                if let Some(val_type) = &value.r#type {
-                    param_types.insert(param_name.clone(), val_type.clone());
-                } else {
-                    let inferred_type = infer_type_from_value(value).map_err(|e| match e {
-                        Error::ParameterTypeInferenceFailed(_, detail) => {
-                            Error::ParameterTypeInferenceFailed(param_name.clone(), detail)
-                        }
-                        other => other,
-                    })?;
-                    param_types.insert(param_name.clone(), inferred_type);
+            // 3. Populate cached_stmt from cache so telemetry/telemetry updates correctly
+            cached_stmt = self.statement_cache.lookup_by_query(&request.query);
+
+            // 4. Swap inline
+            request.prepared_query = prepare_resp.prepared_query;
+            request.query.clear();
+            request.data_format = None;
+        }
+
+        let mut token_to_use = request.prepared_query.clone();
+
+        // Case 2-B: Token-Bound Execution (Pre-prepared / Use Case A)
+        if !token_to_use.is_empty() && request.query.is_empty() {
+            if let Some(stmt) = self.statement_cache.lookup_by_token(&token_to_use) {
+                cached_stmt = Some(stmt.clone());
+                if let Some(elapsed) = tokio::time::Instant::now().checked_duration_since(stmt.base_instant) {
+                    stmt.last_executed_seconds.store(elapsed.as_secs(), std::sync::atomic::Ordering::Relaxed);
+                }
+                if let Some(latest_plan) = stmt.plan_state.load_full() {
+                    if latest_plan.plan_token != token_to_use {
+                        log::info!("Transparently swapping stale prepared query token with proactively refreshed token");
+                        token_to_use = latest_plan.plan_token.clone();
+                        request.prepared_query = token_to_use.clone();
+                    }
+                }
+            }
+        }
+
+        let mut retry_count = 0;
+        loop {
+            if let Some(ref stmt) = cached_stmt {
+                if let Some(elapsed) =
+                    tokio::time::Instant::now().checked_duration_since(stmt.base_instant)
+                {
+                    stmt.last_executed_seconds
+                        .store(elapsed.as_secs(), std::sync::atomic::Ordering::Relaxed);
                 }
             }
 
-            let prepare_request = PrepareQueryRequest {
-                instance_name: instance_name.clone(),
-                app_profile_id: app_profile_id.clone(),
-                query,
-                data_format,
-                param_types,
-            };
+            let mut tonic_req = request.clone().into_request();
+            if !token_to_use.is_empty() {
+                let req_inner = tonic_req.get_mut();
+                req_inner.prepared_query = token_to_use.clone();
+            }
 
-            let mut prep_tonic_req = prepare_request.into_request();
-            prep_tonic_req.metadata_mut().insert(
+            tonic_req.metadata_mut().insert(
                 "x-goog-request-params",
                 MetadataValue::from_str(&format!(
                     "name={}&app_profile_id={}",
@@ -667,51 +721,131 @@ impl BigTable {
                 .map_err(Error::MetadataError)?,
             );
 
-            // Execute the unary compilation RPC call
-            let prepare_response = self
-                .client
-                .prepare_query(prep_tonic_req)
-                .await?
-                .into_inner();
+            match self.client.execute_query(tonic_req).await {
+                Ok(resp) => {
+                    return Ok(resp.into_inner());
+                }
+                Err(status)
+                    if status.code() == tonic::Code::InvalidArgument
+                        && status.message().contains("PREPARED_QUERY_EXPIRED") =>
+                {
+                    if retry_count >= 2 {
+                        return Err(Error::RpcError(status));
+                    }
+                    log::warn!("Server-side plan expired (PREPARED_QUERY_EXPIRED). Evicting plan and retrying compile...");
 
-            // Overwrite the request parameters with the compiled plan token
-            request.prepared_query = prepare_response.prepared_query;
-            request.query.clear();
-            request.data_format = None;
+                    let stmt = if let Some(ref s) = cached_stmt {
+                        Some(s.clone())
+                    } else {
+                        self.statement_cache.lookup_by_token(&token_to_use)
+                    };
+
+                    self.statement_cache.remove_token(&token_to_use);
+
+                    if let Some(stmt) = stmt {
+                        let current = stmt.plan_state.load();
+                        if let Some(ref current_plan) = *current {
+                            if current_plan.plan_token == token_to_use {
+                                let stmt_handle = prepared_statement::PreparedStatement {
+                                    inner: stmt.clone(),
+                                };
+                                // Force eviction of the stale plan
+                                stmt.plan_state.compare_and_swap(&current, None);
+                                match stmt_handle.get_or_prepare(self).await {
+                                    Ok(new_plan) => {
+                                        token_to_use = new_plan.plan_token.clone();
+                                    }
+                                    Err(e) => {
+                                        return Err(e);
+                                    }
+                                }
+                            } else {
+                                token_to_use = current_plan.plan_token.clone();
+                            }
+                        } else {
+                            let stmt_handle = prepared_statement::PreparedStatement {
+                                inner: stmt.clone(),
+                            };
+                            match stmt_handle.get_or_prepare(self).await {
+                                Ok(new_plan) => {
+                                    token_to_use = new_plan.plan_token.clone();
+                                }
+                                Err(e) => {
+                                    return Err(e);
+                                }
+                            }
+                        }
+                    } else {
+                        return Err(Error::RpcError(status));
+                    }
+
+                    retry_count += 1;
+                }
+                Err(other) => return Err(Error::RpcError(other)),
+            }
         }
-
-        let mut tonic_req: tonic::Request<_> = request.into_request();
-        // Add x-goog-request-params header with routing options, without those the call fails.
-        tonic_req.metadata_mut().insert(
-            "x-goog-request-params",
-            MetadataValue::from_str(&format!(
-                "name={}&app_profile_id={}",
-                self.instance_prefix, app_profile_id
-            ))
-            .map_err(Error::MetadataError)?,
-        );
-        let response = self.client.execute_query(tonic_req).await?.into_inner();
-        Ok(response)
     }
 
-    /// Wrapped `prepare_query` method to support Phase 2 migration.
-    /// Allows client applications to explicitly pre-compile and cache query plans.
+    /// Wrapped `prepare_query` method to support Phase 2 migration with client-side caching.
     pub async fn prepare_query(
         &mut self,
         request: PrepareQueryRequest,
     ) -> Result<PrepareQueryResponse> {
+        let query = request.query.clone();
         let app_profile_id = request.app_profile_id.clone();
-        let mut tonic_req = request.into_request();
-        tonic_req.metadata_mut().insert(
-            "x-goog-request-params",
-            MetadataValue::from_str(&format!(
-                "name={}&app_profile_id={}",
-                self.instance_prefix, app_profile_id
-            ))
-            .map_err(Error::MetadataError)?,
-        );
-        let response = self.client.prepare_query(tonic_req).await?.into_inner();
-        Ok(response)
+
+        // 1. Look up in query_to_statement cache
+        let statement = self.statement_cache.get_or_insert_query(&query, || {
+            let param_types = request
+                .param_types
+                .iter()
+                .map(|(k, v)| {
+                    (
+                        k.clone(),
+                        crate::bigtable::sql::SqlType::from_pb(v)
+                            .unwrap_or(crate::bigtable::sql::SqlType::Bytes),
+                    )
+                })
+                .collect::<std::collections::HashMap<_, _>>();
+
+            let base_instant = tokio::time::Instant::now();
+            Arc::new(prepared_statement::PreparedStatementInner {
+                query: query.clone(),
+                app_profile_id: app_profile_id.clone(),
+                param_types,
+                plan_state: arc_swap::ArcSwapOption::empty(),
+                prepare_lock: tokio::sync::Mutex::new(()),
+                base_instant,
+                last_executed_seconds: std::sync::atomic::AtomicU64::new(0),
+                cache: Arc::downgrade(&self.statement_cache),
+            })
+        });
+
+        // 2. Get or compile the plan token
+        let stmt_handle = prepared_statement::PreparedStatement {
+            inner: statement.clone(),
+        };
+        let plan = stmt_handle.get_or_prepare(self).await?;
+
+        // 3. Return the compiled PrepareQueryResponse
+        let duration = plan
+            .expires_at
+            .checked_duration_since(tokio::time::Instant::now())
+            .unwrap_or(std::time::Duration::from_secs(0));
+        let now = std::time::SystemTime::now();
+        let future = now + duration;
+        let dur_since_epoch = future
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap_or(std::time::Duration::from_secs(0));
+
+        Ok(PrepareQueryResponse {
+            prepared_query: plan.plan_token.clone(),
+            valid_until: Some(prost_types::Timestamp {
+                seconds: dur_since_epoch.as_secs() as i64,
+                nanos: dur_since_epoch.subsec_nanos() as i32,
+            }),
+            ..Default::default()
+        })
     }
 
     /// Provide a convenient method to get the inner `BigtableClient` so user can use any methods

@@ -60,6 +60,46 @@ impl SqlType {
         };
         Type { kind }
     }
+
+    /// Parses a Tonic protobuf `Type` back into the type-safe `SqlType` representation.
+    pub fn from_pb(pb: &Type) -> Option<Self> {
+        let kind = pb.kind.as_ref()?;
+        match kind {
+            TypeKind::StringType(_) => Some(SqlType::String),
+            TypeKind::Int64Type(_) => Some(SqlType::Int64),
+            TypeKind::BoolType(_) => Some(SqlType::Bool),
+            TypeKind::BytesType(_) => Some(SqlType::Bytes),
+            TypeKind::Float32Type(_) => Some(SqlType::Float32),
+            TypeKind::Float64Type(_) => Some(SqlType::Float64),
+            TypeKind::TimestampType(_) => Some(SqlType::Timestamp),
+            TypeKind::DateType(_) => Some(SqlType::Date),
+            TypeKind::ArrayType(arr) => {
+                let element = arr.element_type.as_ref()?;
+                let parsed_element = SqlType::from_pb(element)?;
+                Some(SqlType::Array(Box::new(parsed_element)))
+            }
+            TypeKind::StructType(st) => {
+                let mut fields = Vec::new();
+                for field in &st.fields {
+                    let field_type = field.r#type.as_ref()?;
+                    let parsed_field = SqlType::from_pb(field_type)?;
+                    fields.push((field.field_name.clone(), parsed_field));
+                }
+                Some(SqlType::Struct(fields))
+            }
+            TypeKind::MapType(m) => {
+                let k_type = m.key_type.as_ref()?;
+                let v_type = m.value_type.as_ref()?;
+                let parsed_k = SqlType::from_pb(k_type)?;
+                let parsed_v = SqlType::from_pb(v_type)?;
+                Some(SqlType::Map {
+                    key_type: Box::new(parsed_k),
+                    value_type: Box::new(parsed_v),
+                })
+            }
+            _ => None,
+        }
+    }
 }
 
 /// Extension trait designed to attach ergonomic schema mapping decorators

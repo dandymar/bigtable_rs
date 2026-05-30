@@ -23,6 +23,7 @@ tower = { version = "0.5.1", features = ["util"] }
 # end of above part
 futures-util = "0.3.31"
 gcp_auth = "0.12.2"
+prost-types = "0.14.1"
 log = "0.4.20"
 thiserror = "2.0.3"
 arc-swap = "1.7.1"

@@ -4,11 +4,12 @@ use arc_swap::ArcSwapOption;
 use googleapis_tonic_google_bigtable_v2::google::bigtable::v2::{
     ExecuteQueryRequest, ExecuteQueryResponse, PrepareQueryRequest, Value,
 };
+use std::collections::{HashMap, VecDeque};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex, RwLock, Weak};
 use std::time::Duration;
-use tokio::sync::Mutex;
+use tokio::sync::Mutex as AsyncMutex;
 use tokio::time::Instant;
 use tonic::metadata::MetadataValue;
 use tonic::IntoRequest;
@@ -22,29 +23,184 @@ pub struct CompiledPlanState {
     pub expires_at: Instant,
 }
 
+/// Thread-safe, client-scoped prepared statement cache.
+pub struct ClientStatementCache {
+    /// Maps raw SQL query strings to their statement handles
+    pub query_to_statement: RwLock<HashMap<String, Weak<PreparedStatementInner>>>,
+    /// Maps active plan token bytes to their statement handles
+    pub token_to_statement: RwLock<HashMap<Vec<u8>, Weak<PreparedStatementInner>>>,
+    /// Bounded LRU cache to hold strong references for raw SQL (Use Case B) statement handles
+    pub active_lru: StdMutex<VecDeque<Arc<PreparedStatementInner>>>,
+}
+
+impl Default for ClientStatementCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ClientStatementCache {
+    /// Constructs a new ClientStatementCache.
+    pub fn new() -> Self {
+        Self {
+            query_to_statement: RwLock::new(HashMap::new()),
+            token_to_statement: RwLock::new(HashMap::new()),
+            active_lru: StdMutex::new(VecDeque::new()),
+        }
+    }
+
+    /// Inserts a query-to-statement mapping.
+    pub fn insert_query(&self, query: String, statement: Arc<PreparedStatementInner>) {
+        self.query_to_statement
+            .write()
+            .unwrap()
+            .insert(query, Arc::downgrade(&statement));
+    }
+
+    /// Inserts a token-to-statement mapping.
+    pub fn insert_token(&self, token: Vec<u8>, statement: Arc<PreparedStatementInner>) {
+        self.token_to_statement
+            .write()
+            .unwrap()
+            .insert(token, Arc::downgrade(&statement));
+    }
+
+    /// Removes a token-to-statement mapping.
+    pub fn remove_token(&self, token: &[u8]) {
+        self.token_to_statement.write().unwrap().remove(token);
+    }
+
+    /// Looks up a statement by its query template string.
+    pub fn lookup_by_query(&self, query: &str) -> Option<Arc<PreparedStatementInner>> {
+        let mut _evicted_stmt: Option<Arc<PreparedStatementInner>> = None;
+        let result = {
+            let query_map = self.query_to_statement.read().unwrap();
+            if let Some(weak_stmt) = query_map.get(query) {
+                if let Some(stmt) = weak_stmt.upgrade() {
+                    // Low-contention LRU Promotion: Only promote if last executed was > 10s ago
+                    let now = Instant::now().duration_since(stmt.base_instant).as_secs();
+                    let last = stmt.last_executed_seconds.load(Ordering::Relaxed);
+                    if now.saturating_sub(last) > 10 {
+                        let mut lru = self.active_lru.lock().unwrap();
+                        lru.retain(|x| !Arc::ptr_eq(x, &stmt));
+                        lru.push_back(stmt.clone());
+                        if lru.len() > 1000 {
+                            _evicted_stmt = lru.pop_front();
+                        }
+                    }
+                    Some(stmt)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        }; // query_map read guard and active_lru lock guard go out of scope here
+
+        // _evicted_stmt is dropped safely here, outside the RwLock/Mutex scope
+        drop(_evicted_stmt);
+        result
+    }
+
+    /// Looks up a statement by its compiled plan token bytes.
+    pub fn lookup_by_token(&self, token: &[u8]) -> Option<Arc<PreparedStatementInner>> {
+        let mut _evicted_stmt: Option<Arc<PreparedStatementInner>> = None;
+        let result = {
+            let token_map = self.token_to_statement.read().unwrap();
+            if let Some(weak_stmt) = token_map.get(token) {
+                if let Some(stmt) = weak_stmt.upgrade() {
+                    // Low-contention LRU Promotion: Only promote if last executed was > 10s ago
+                    let now = Instant::now().duration_since(stmt.base_instant).as_secs();
+                    let last = stmt.last_executed_seconds.load(Ordering::Relaxed);
+                    if now.saturating_sub(last) > 10 {
+                        let mut lru = self.active_lru.lock().unwrap();
+                        lru.retain(|x| !Arc::ptr_eq(x, &stmt));
+                        lru.push_back(stmt.clone());
+                        if lru.len() > 1000 {
+                            _evicted_stmt = lru.pop_front();
+                        }
+                    }
+                    Some(stmt)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        }; // token_map read guard and active_lru lock guard go out of scope here
+
+        // _evicted_stmt is dropped safely here, outside the RwLock/Mutex scope
+        drop(_evicted_stmt);
+        result
+    }
+
+    /// Looks up a statement by its query, or if it doesn't exist, inserts the one returned by `creator`.
+    /// This prevents duplicate statements on concurrent cache misses.
+    pub fn get_or_insert_query<F>(&self, query: &str, creator: F) -> Arc<PreparedStatementInner>
+    where
+        F: FnOnce() -> Arc<PreparedStatementInner>,
+    {
+        if let Some(stmt) = self.lookup_by_query(query) {
+            return stmt;
+        }
+
+        let mut _evicted_stmt: Option<Arc<PreparedStatementInner>> = None;
+        let stmt = {
+            let mut query_map = self.query_to_statement.write().unwrap();
+            // Double check under write lock
+            if let Some(weak_stmt) = query_map.get(query) {
+                if let Some(stmt) = weak_stmt.upgrade() {
+                    let mut lru = self.active_lru.lock().unwrap();
+                    lru.retain(|x| !Arc::ptr_eq(x, &stmt));
+                    lru.push_back(stmt.clone());
+                    if lru.len() > 1000 {
+                        _evicted_stmt = lru.pop_front();
+                    }
+                    return stmt;
+                }
+            }
+            let stmt = creator();
+            query_map.insert(query.to_string(), Arc::downgrade(&stmt));
+
+            let mut lru = self.active_lru.lock().unwrap();
+            lru.push_back(stmt.clone());
+            if lru.len() > 1000 {
+                _evicted_stmt = lru.pop_front();
+            }
+            stmt
+        }; // query_map write guard and active_lru lock guard go out of scope here
+
+        // _evicted_stmt is dropped safely here, outside the RwLock/Mutex scope
+        drop(_evicted_stmt);
+        stmt
+    }
+}
+
 /// Inner shared state of a prepared statement, wrapped in a single Arc.
-struct PreparedStatementInner {
+pub struct PreparedStatementInner {
     /// The raw SQL query template (e.g., "SELECT * FROM users WHERE id = @id")
-    query: String,
+    pub query: String,
     /// The default application profile routing
-    app_profile_id: String,
+    pub app_profile_id: String,
     /// Expected SQL type declarations of query parameters for server compilation
-    param_types: std::collections::HashMap<String, SqlType>,
+    pub param_types: std::collections::HashMap<String, SqlType>,
     /// Lock-free atomic storage for the compiled plan state reference
-    plan_state: ArcSwapOption<CompiledPlanState>,
+    pub plan_state: ArcSwapOption<CompiledPlanState>,
     /// Localized mutex to serialize PrepareQuery calls on cache misses/expirations
-    prepare_lock: Mutex<()>,
+    pub prepare_lock: AsyncMutex<()>,
     /// Fixed base instant to calculate relative elapsed time for lock-free atomics
-    base_instant: Instant,
+    pub base_instant: Instant,
     /// Lock-free atomic elapsed seconds since base_instant when last executed
-    last_executed_seconds: AtomicU64,
+    pub last_executed_seconds: AtomicU64,
+    /// Weak reference to the parent cache to enable clean deregistration on drop
+    pub cache: Weak<ClientStatementCache>,
 }
 
 /// Exposes a prepared query statement handle. The cache is decentralized
 /// and housed directly inside this instance, achieving lock-free, zero-contention reads!
 #[derive(Clone)]
 pub struct PreparedStatement {
-    inner: Arc<PreparedStatementInner>,
+    pub(crate) inner: Arc<PreparedStatementInner>,
 }
 
 impl PreparedStatement {
@@ -66,11 +222,22 @@ impl PreparedStatement {
                 app_profile_id,
                 param_types,
                 plan_state: ArcSwapOption::empty(),
-                prepare_lock: Mutex::new(()),
+                prepare_lock: AsyncMutex::new(()),
                 base_instant,
                 last_executed_seconds: AtomicU64::new(0),
+                cache: Weak::new(),
             }),
         }
+    }
+
+    /// Constructs PreparedStatement from a shared inner state.
+    pub fn from_inner(inner: Arc<PreparedStatementInner>) -> Self {
+        Self { inner }
+    }
+
+    /// Returns the shared inner state of the prepared statement.
+    pub fn into_inner(self) -> Arc<PreparedStatementInner> {
+        self.inner
     }
 
     /// Access the lock-free plan state reference (used inside tests).
@@ -172,6 +339,11 @@ impl PreparedStatement {
             plan_token: response.prepared_query,
             expires_at,
         });
+
+        // Register initial token in client cache
+        client
+            .statement_cache
+            .insert_token(compiled_state.plan_token.clone(), self.inner.clone());
 
         // Correct initialization: mark used immediately on successful compilation
         self.mark_used();
@@ -308,8 +480,24 @@ impl PreparedStatement {
                         expires_at: new_expires_at,
                     });
 
-                    // Swap pointer atomically (instantly visible to serving threads)
-                    inner.plan_state.store(Some(new_plan));
+                    // 1. Register new token in client cache
+                    client
+                        .statement_cache
+                        .insert_token(new_plan.plan_token.clone(), inner.clone());
+
+                    // 2. Swap pointer atomically (instantly visible to serving threads)
+                    let old_plan = inner.plan_state.swap(Some(new_plan.clone()));
+
+                    // 3. Safely remove the old token from the cache with a 10s grace period
+                    if let Some(old) = old_plan {
+                        if old.plan_token != new_plan.plan_token {
+                            let client_clone = client.clone();
+                            tokio::spawn(async move {
+                                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                                client_clone.statement_cache.remove_token(&old.plan_token);
+                            });
+                        }
+                    }
                     log::info!(
                         "Successfully rotated plan token asynchronously for '{}'",
                         inner.query
@@ -390,6 +578,8 @@ impl PreparedStatement {
                     }
                     log::warn!("Server-side plan expired (PREPARED_QUERY_EXPIRED). Evicting plan and retrying compile...");
 
+                    client.statement_cache.remove_token(&plan.plan_token);
+
                     // Lock-free Atomic CAS Eviction to guarantee we do not overwrite new valid concurrent plan swaps
                     let current = self.inner.plan_state.load();
                     if let Some(ref current_plan) = *current {
@@ -401,6 +591,31 @@ impl PreparedStatement {
                     retry_count += 1;
                 }
                 Err(other) => return Err(other),
+            }
+        }
+    }
+}
+
+impl Drop for PreparedStatementInner {
+    fn drop(&mut self) {
+        if let Some(cache) = self.cache.upgrade() {
+            // Remove from query map
+            {
+                let mut query_map = cache.query_to_statement.write().unwrap();
+                if let Some(weak_ref) = query_map.get(&self.query) {
+                    if weak_ref.strong_count() == 0 {
+                        query_map.remove(&self.query);
+                    }
+                }
+            }
+            // Remove from token map if plan token exists
+            if let Some(plan) = self.plan_state.load_full() {
+                let mut token_map = cache.token_to_statement.write().unwrap();
+                if let Some(weak_ref) = token_map.get(&plan.plan_token) {
+                    if weak_ref.strong_count() == 0 {
+                        token_map.remove(&plan.plan_token);
+                    }
+                }
             }
         }
     }
