@@ -25,6 +25,7 @@ futures-util = "0.3.31"
 gcp_auth = "0.12.2"
 log = "0.4.20"
 thiserror = "2.0.3"
+arc-swap = "1.7.1"
 
 [features]
 default = ["tonic-tls-aws-lc"]
@@ -48,7 +49,11 @@ serde = { version = "1.0.192", features = ["derive"] }
 serde_with = { version = "3.4.0", features = ["base64"] }
 serde_json = "1.0.85"
 serde_path_to_error = "0.1.8"
-tokio = { version = "1.25.0", features = ["rt-multi-thread", "macros"] }
+tokio = { version = "1.25.0", features = ["rt-multi-thread", "macros", "time", "test-util"] }
+bytes = "1.9.0"
+http-body-util = "0.1.0"
+axum = "0.8.9"
+hyper = "1.9.0"
 
 [build-dependencies]
 tonic-prost-build = { version = "0.14.2", features = ["cleanup-markdown"] }
