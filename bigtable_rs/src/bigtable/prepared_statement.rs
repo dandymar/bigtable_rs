@@ -576,7 +576,9 @@ impl PreparedStatement {
             ..Default::default()
         };
 
-        client.execute_query(execute_request).await
+        let res = client.execute_query(execute_request).await;
+        self.mark_used();
+        res
     }
 
     /// Reactive retry: automatically traps PREPARED_QUERY_EXPIRED, evicts plan and retries
@@ -601,7 +603,10 @@ impl PreparedStatement {
             };
 
             match client.execute_query(execute_request).await {
-                Ok(stream) => return Ok(stream),
+                Ok(stream) => {
+                    self.mark_used();
+                    return Ok(stream);
+                }
                 Err(Error::RpcError(status))
                     if (status.code() == tonic::Code::FailedPrecondition
                         || status.code() == tonic::Code::InvalidArgument)

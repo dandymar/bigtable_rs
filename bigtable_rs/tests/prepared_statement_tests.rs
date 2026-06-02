@@ -2264,25 +2264,52 @@ async fn test_proactive_refresh_slow_network_response() {
     // (slow) PrepareQuery RPC. Execute once more to mark the statement active.
     let pre_refresh = time_to_refresh.saturating_sub(Duration::from_secs(2));
     tokio::time::advance(pre_refresh).await;
+
     let _stream2 = stmt
         .execute_with_retry(&mut client, std::collections::HashMap::new())
         .await
         .unwrap();
-    tokio::task::yield_now().await;
+
     tokio::time::advance(Duration::from_secs(3)).await; // cross the refresh threshold
+
+    // Avoid Bug C (TCP Loopback Dispatch Race): deterministic polling loop for prepare_call_count to become 2
+    let mut success = false;
+    for _ in 0..100 {
+        if mock_service
+            .prepare_call_count
+            .load(std::sync::atomic::Ordering::SeqCst)
+            == 2
+        {
+            success = true;
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        success,
+        "prepare_call_count did not reach 2 within the polling loop"
+    );
 
     // Advance past the plan's client-side expiry so the concurrent get_or_prepare
     // takes the slow path and must wait on the prepare_lock held by the background task.
     tokio::time::advance(offset + Duration::from_secs(1)).await;
 
-    // Spawn a concurrent get_or_prepare. It must block on prepare_lock rather than
-    // issuing its own PrepareQuery RPC (singleflight behaviour).
+    // Spawn the concurrent query thread. It must block on the `prepare_lock` rather than making a second PrepareQuery RPC!
     let mut client_clone = client.clone();
     let stmt_clone = stmt.clone();
     let handle =
         tokio::spawn(async move { stmt_clone.get_or_prepare(&mut client_clone).await.unwrap() });
 
-    tokio::task::yield_now().await;
+    // Avoid Bug D (Weak Concurrent Blocking Verification): yield 10 times to guarantee that the concurrent thread runs and blocks
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+    }
+
+    // Before awaiting handle, explicitly advance virtual time by another 3 seconds (taking the clock to 45s)
+    // to guarantee that the mock RPC's 10-second delay resolves, the proactive refresh releases the lock,
+    // and the concurrent thread can acquire the lock and complete deterministically.
+    tokio::time::advance(Duration::from_secs(3)).await;
+
     let plan = handle.await.unwrap();
     assert_eq!(plan.plan_token, b"token_v2");
 
