@@ -2228,10 +2228,8 @@ async fn test_proactive_refresh_slow_network_response() {
         .next_prepare_ttl_secs
         .store(30, std::sync::atomic::Ordering::SeqCst);
 
-    // Inject a delay on the next PrepareQuery RPC (during proactive background refresh)
-    *mock_service.prepare_delay.lock().unwrap() = Some(Duration::from_secs(10));
-
-    // First execution establishes the plan
+    // First execution establishes the plan with no delay so the initial compile
+    // does not cause unexpected virtual-clock auto-advance.
     let stmt = PreparedStatement::new("SELECT * FROM table".to_string(), "default".to_string());
     let _stream = stmt
         .execute_with_retry(&mut client, std::collections::HashMap::new())
@@ -2240,21 +2238,45 @@ async fn test_proactive_refresh_slow_network_response() {
 
     let plan_v1 = stmt.plan_state().load_full().unwrap();
     assert_eq!(plan_v1.plan_token, b"initial_token");
+    assert_eq!(
+        mock_service
+            .prepare_call_count
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
 
-    // Advance time to proactive refresh trigger (offset is 20% of 30s = 6s, trigger is at 24s)
-    tokio::time::advance(Duration::from_secs(24)).await;
-    // Execute query to mark used/active
+    // Inject the slow-network delay only now, so it applies to the background refresh
+    // RPC but not the initial compile. Also arm token_v2 before advancing so the mock
+    // returns it regardless of when its timer fires.
+    *mock_service.prepare_delay.lock().unwrap() = Some(Duration::from_secs(10));
+    *mock_service.next_prepare_token.lock().unwrap() = "token_v2".to_string();
+
+    // Compute the actual refresh threshold from expires_at (robust to any
+    // gRPC-induced virtual-clock auto-advance during the initial compile).
+    let ttl_secs = 30u64;
+    let offset = Duration::from_secs(ttl_secs / 5);
+    let now = tokio::time::Instant::now();
+    let time_to_refresh = (plan_v1.expires_at - offset)
+        .checked_duration_since(now)
+        .unwrap_or_default();
+
+    // Advance to the refresh threshold so the background task wakes and starts its
+    // (slow) PrepareQuery RPC. Execute once more to mark the statement active.
+    let pre_refresh = time_to_refresh.saturating_sub(Duration::from_secs(2));
+    tokio::time::advance(pre_refresh).await;
     let _stream2 = stmt
         .execute_with_retry(&mut client, std::collections::HashMap::new())
         .await
         .unwrap();
     tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_secs(3)).await; // cross the refresh threshold
 
-    // Warp time past the 30s original plan expiration (e.g., to 32s) while refresh is in-flight
-    *mock_service.next_prepare_token.lock().unwrap() = "token_v2".to_string();
-    tokio::time::advance(Duration::from_secs(8)).await;
+    // Advance past the plan's client-side expiry so the concurrent get_or_prepare
+    // takes the slow path and must wait on the prepare_lock held by the background task.
+    tokio::time::advance(offset + Duration::from_secs(1)).await;
 
-    // Spawn a concurrent query thread. It must block on the `prepare_lock` rather than making a second PrepareQuery RPC!
+    // Spawn a concurrent get_or_prepare. It must block on prepare_lock rather than
+    // issuing its own PrepareQuery RPC (singleflight behaviour).
     let mut client_clone = client.clone();
     let stmt_clone = stmt.clone();
     let handle =
@@ -2264,7 +2286,7 @@ async fn test_proactive_refresh_slow_network_response() {
     let plan = handle.await.unwrap();
     assert_eq!(plan.plan_token, b"token_v2");
 
-    // Exactly 1 initial prepare + exactly 1 proactive prepare (even though it was delayed) = 2 prepares total!
+    // Exactly 1 initial prepare + 1 proactive refresh = 2 total PrepareQuery RPCs.
     assert_eq!(
         mock_service
             .prepare_call_count
