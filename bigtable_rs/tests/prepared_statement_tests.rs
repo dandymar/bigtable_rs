@@ -38,6 +38,10 @@ struct CustomMockService {
             Vec<googleapis_tonic_google_bigtable_v2::google::bigtable::v2::ExecuteQueryRequest>,
         >,
     >,
+    prepare_fail_count: Arc<std::sync::atomic::AtomicUsize>,
+    prepare_error_status: Arc<std::sync::Mutex<Option<tonic::Status>>>,
+    execute_always_expire: Arc<std::sync::atomic::AtomicBool>,
+    prepare_delay: Arc<std::sync::Mutex<Option<Duration>>>,
 }
 
 impl Service<http::Request<hyper::body::Incoming>> for CustomMockService {
@@ -59,14 +63,44 @@ impl Service<http::Request<hyper::body::Incoming>> for CustomMockService {
                     .prepare_call_count
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
+                // Handle optional delay
+                let delay = *self_clone.prepare_delay.lock().unwrap();
+                if let Some(d) = delay {
+                    tokio::time::sleep(d).await;
+                }
+
+                // Handle optional failure injection
+                let fail_count = self_clone
+                    .prepare_fail_count
+                    .load(std::sync::atomic::Ordering::SeqCst);
+                if fail_count > 0 {
+                    self_clone
+                        .prepare_fail_count
+                        .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                    let status = self_clone
+                        .prepare_error_status
+                        .lock()
+                        .unwrap()
+                        .clone()
+                        .unwrap_or_else(|| tonic::Status::unavailable("Service Unavailable"));
+                    let response = http::Response::builder()
+                        .status(200)
+                        .header("content-type", "application/grpc")
+                        .header("grpc-status", status.code().to_string())
+                        .header("grpc-message", status.message().to_owned())
+                        .body(tonic::body::Body::new(Empty::new()))
+                        .unwrap();
+                    return Ok(response);
+                }
+
                 let token = self_clone.next_prepare_token.lock().unwrap().clone();
                 let ttl_secs = self_clone
                     .next_prepare_ttl_secs
                     .load(std::sync::atomic::Ordering::SeqCst);
 
                 // valid_until must be an absolute Unix timestamp, not a relative duration.
-                let expires = std::time::SystemTime::now()
-                    + std::time::Duration::from_secs(ttl_secs);
+                let expires =
+                    std::time::SystemTime::now() + std::time::Duration::from_secs(ttl_secs);
                 let since_epoch = expires
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default();
@@ -112,18 +146,24 @@ impl Service<http::Request<hyper::body::Incoming>> for CustomMockService {
                     }
                 }
 
-                if self_clone
+                let always_expire = self_clone
+                    .execute_always_expire
+                    .load(std::sync::atomic::Ordering::SeqCst);
+                let should_expire = self_clone
                     .should_expire_on_execute
-                    .load(std::sync::atomic::Ordering::SeqCst)
-                {
-                    self_clone
-                        .should_expire_on_execute
-                        .store(false, std::sync::atomic::Ordering::SeqCst);
+                    .load(std::sync::atomic::Ordering::SeqCst);
+                if always_expire || should_expire {
+                    if !always_expire {
+                        self_clone
+                            .should_expire_on_execute
+                            .store(false, std::sync::atomic::Ordering::SeqCst);
+                    }
 
                     let response = http::Response::builder()
                         .status(200)
                         .header("content-type", "application/grpc")
-                        .header("grpc-status", "3") // InvalidArgument
+                        // Return FailedPrecondition (9) in tests to verify FailedPrecondition recovery fix!
+                        .header("grpc-status", "9")
                         .header(
                             "grpc-message",
                             "PREPARED_QUERY_EXPIRED: the prepared query has expired",
@@ -164,6 +204,10 @@ async fn start_mock_server() -> (CustomMockService, BigTable) {
         next_prepare_ttl_secs: Arc::new(std::sync::atomic::AtomicU64::new(3600)),
         should_expire_on_execute: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         executed_requests: Arc::new(std::sync::Mutex::new(Vec::new())),
+        prepare_fail_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        prepare_error_status: Arc::new(std::sync::Mutex::new(None)),
+        execute_always_expire: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        prepare_delay: Arc::new(std::sync::Mutex::new(None)),
     };
 
     let service_clone = service.clone();
@@ -513,7 +557,11 @@ async fn test_client_proactive_refresh_under_paused_time() {
         .statement_cache()
         .lookup_by_query("SELECT * FROM table WHERE col = @param1", "default")
         .expect("statement should be cached");
-    let expires_at = inner.plan_state.load_full().expect("plan should be set").expires_at;
+    let expires_at = inner
+        .plan_state
+        .load_full()
+        .expect("plan should be set")
+        .expires_at;
     let ttl_secs = 30u64;
     let offset = Duration::from_secs(ttl_secs / 5); // = 6s
     let now = tokio::time::Instant::now();
@@ -696,7 +744,11 @@ async fn test_client_raw_query_proactive_refresh() {
         .statement_cache()
         .lookup_by_query("SELECT * FROM table WHERE col = @param1", "default")
         .expect("statement should be cached");
-    let expires_at = inner.plan_state.load_full().expect("plan should be set").expires_at;
+    let expires_at = inner
+        .plan_state
+        .load_full()
+        .expect("plan should be set")
+        .expires_at;
     let ttl_secs = 30u64;
     let offset = Duration::from_secs(ttl_secs / 5);
     let now = tokio::time::Instant::now();
@@ -910,7 +962,11 @@ async fn test_token_pruning_leak_safety() {
         .statement_cache()
         .lookup_by_query("SELECT * FROM table WHERE col = @param1", "default")
         .expect("statement should be cached");
-    let expires_at = inner.plan_state.load_full().expect("plan should be set").expires_at;
+    let expires_at = inner
+        .plan_state
+        .load_full()
+        .expect("plan should be set")
+        .expires_at;
     let ttl_secs = 30u64;
     let offset = Duration::from_secs(ttl_secs / 5);
     let now = tokio::time::Instant::now();
@@ -988,7 +1044,10 @@ async fn test_weak_reference_cleanup_and_lru() {
 
     let weak_stmt = {
         let query_map = client.statement_cache().query_to_statement.read().unwrap();
-        query_map.get(&(query.clone(), "default".to_string())).cloned().unwrap()
+        query_map
+            .get(&(query.clone(), "default".to_string()))
+            .cloned()
+            .unwrap()
     };
 
     assert!(weak_stmt.upgrade().is_some());
@@ -1010,17 +1069,25 @@ async fn test_weak_reference_cleanup_and_lru() {
 
     for i in 0..1005 {
         let unique_query = format!("SELECT * FROM table WHERE id = {}", i);
-        let stmt = Arc::new(bigtable_rs::bigtable::prepared_statement::PreparedStatementInner {
-            query: unique_query.clone(),
-            app_profile_id: "default".to_string(),
-            param_types: std::collections::HashMap::new(),
-            plan_state: arc_swap::ArcSwapOption::empty(),
-            prepare_lock: tokio::sync::Mutex::new(()),
-            base_instant: tokio::time::Instant::now(),
-            last_executed_seconds: std::sync::atomic::AtomicU64::new(0),
-            cache: std::sync::Arc::downgrade(&client.statement_cache_arc()),
-        });
-        client.statement_cache().get_or_insert_query(&unique_query, "default", || stmt);
+        let stmt = Arc::new(
+            bigtable_rs::bigtable::prepared_statement::PreparedStatementInner {
+                query: unique_query.clone(),
+                app_profile_id: "default".to_string(),
+                param_types: std::collections::HashMap::new(),
+                plan_state: arc_swap::ArcSwapOption::empty(),
+                prepare_lock: tokio::sync::Mutex::new(()),
+                base_instant: tokio::time::Instant::now(),
+                last_executed_seconds: std::sync::atomic::AtomicU64::new(0),
+                cache: {
+                    let c = std::sync::OnceLock::new();
+                    let _ = c.set(std::sync::Arc::downgrade(&client.statement_cache_arc()));
+                    c
+                },
+            },
+        );
+        client
+            .statement_cache()
+            .get_or_insert_query(&unique_query, "default", || stmt);
     }
 
     let lru_len = client.statement_cache().active_lru.lock().unwrap().len();
@@ -1144,7 +1211,11 @@ async fn test_client_prepare_bind_execute_transparent_swap() {
         .statement_cache()
         .lookup_by_query("SELECT * FROM table WHERE col = @param1", "default")
         .expect("statement should be cached");
-    let expires_at = inner.plan_state.load_full().expect("plan should be set").expires_at;
+    let expires_at = inner
+        .plan_state
+        .load_full()
+        .expect("plan should be set")
+        .expires_at;
     let ttl_secs = 30u64;
     let offset = Duration::from_secs(ttl_secs / 5);
     let now = tokio::time::Instant::now();
@@ -1177,7 +1248,10 @@ async fn test_client_prepare_bind_execute_transparent_swap() {
     // Execute twice just before the refresh threshold to keep the statement active
     let pre_refresh_advance = time_to_refresh.saturating_sub(Duration::from_secs(2));
     tokio::time::advance(pre_refresh_advance).await;
-    let _stream_init = client.execute_query(execute_req_init.clone()).await.unwrap();
+    let _stream_init = client
+        .execute_query(execute_req_init.clone())
+        .await
+        .unwrap();
     tokio::time::advance(Duration::from_secs(1)).await;
     let _stream_init2 = client.execute_query(execute_req_init).await.unwrap();
     tokio::task::yield_now().await;
@@ -1193,21 +1267,14 @@ async fn test_client_prepare_bind_execute_transparent_swap() {
             .statement_cache()
             .lookup_by_token(b"token_v2")
             .is_some();
-        log::info!(
-            "Iteration {}: has_new_token={}",
-            i,
-            has_new_token
-        );
+        log::info!("Iteration {}: has_new_token={}", i, has_new_token);
         if has_new_token {
             success = true;
             break;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    assert!(
-        success,
-        "Failed to rotate token proactively"
-    );
+    assert!(success, "Failed to rotate token proactively");
 
     // Clear logged requests before execution
     mock_service.executed_requests.lock().unwrap().clear();
@@ -1345,7 +1412,10 @@ async fn test_use_case_a_populates_cache_for_use_case_b() {
 
     // The inner should now be visible in the query_to_statement index.
     assert!(
-        client.statement_cache().lookup_by_query(&sql, "default").is_some(),
+        client
+            .statement_cache()
+            .lookup_by_query(&sql, "default")
+            .is_some(),
         "Use Case A inner must be registered in query_to_statement after get_or_prepare"
     );
 
@@ -1625,12 +1695,14 @@ async fn test_get_or_prepare_recompiles_when_client_side_expires_at_passes() {
     // expires_at is already in the past. This is exactly what happens in production
     // after the server-provided TTL elapses and the proactive background refresh
     // has not yet fired (e.g. the statement was idle).
-    let expired_plan = Arc::new(bigtable_rs::bigtable::prepared_statement::CompiledPlanState {
-        plan_token: b"initial_token".to_vec(),
-        expires_at: tokio::time::Instant::now()
-            .checked_sub(std::time::Duration::from_secs(1))
-            .expect("instant subtraction"),
-    });
+    let expired_plan = Arc::new(
+        bigtable_rs::bigtable::prepared_statement::CompiledPlanState {
+            plan_token: b"initial_token".to_vec(),
+            expires_at: tokio::time::Instant::now()
+                .checked_sub(std::time::Duration::from_secs(1))
+                .expect("instant subtraction"),
+        },
+    );
     stmt.plan_state().store(Some(expired_plan));
 
     // Point the mock at a new token so we can confirm a fresh compile occurred.
@@ -1663,11 +1735,10 @@ async fn test_execute_query_float_param_without_explicit_type_returns_inference_
         googleapis_tonic_google_bigtable_v2::google::bigtable::v2::Value {
             kind: Some(
                 googleapis_tonic_google_bigtable_v2::google::bigtable::v2::value::Kind::FloatValue(
-                    3.14,
+                    1.5,
                 ),
             ),
             r#type: None,
-            ..Default::default()
         },
     );
 
@@ -1691,7 +1762,9 @@ async fn test_execute_query_float_param_without_explicit_type_returns_inference_
         "expected ParameterTypeInferenceFailed with param name 'score' and 'float' in the message"
     );
     assert_eq!(
-        _mock_service.prepare_call_count.load(std::sync::atomic::Ordering::SeqCst),
+        _mock_service
+            .prepare_call_count
+            .load(std::sync::atomic::Ordering::SeqCst),
         0,
         "no network call should be made when inference fails"
     );
@@ -1711,7 +1784,6 @@ async fn test_execute_query_null_param_without_explicit_type_returns_inference_e
         googleapis_tonic_google_bigtable_v2::google::bigtable::v2::Value {
             kind: None, // null without an explicit type
             r#type: None,
-            ..Default::default()
         },
     );
 
@@ -1725,7 +1797,10 @@ async fn test_execute_query_null_param_without_explicit_type_returns_inference_e
 
     let result = client.execute_query(request).await;
 
-    assert!(result.is_err(), "expected an error for null param without explicit type");
+    assert!(
+        result.is_err(),
+        "expected an error for null param without explicit type"
+    );
     assert!(
         matches!(
             result.unwrap_err(),
@@ -1735,7 +1810,9 @@ async fn test_execute_query_null_param_without_explicit_type_returns_inference_e
         "expected ParameterTypeInferenceFailed with param name 'optional_field'"
     );
     assert_eq!(
-        _mock_service.prepare_call_count.load(std::sync::atomic::Ordering::SeqCst),
+        _mock_service
+            .prepare_call_count
+            .load(std::sync::atomic::Ordering::SeqCst),
         0,
         "no network call should be made when inference fails"
     );
@@ -1765,7 +1842,6 @@ async fn test_execute_query_array_param_without_explicit_type_returns_inference_
                 ),
             ),
             r#type: None, // no explicit type — inference must fail
-            ..Default::default()
         },
     );
 
@@ -1790,7 +1866,9 @@ async fn test_execute_query_array_param_without_explicit_type_returns_inference_
     );
     // No network call should have been made — the error is caught before PrepareQuery.
     assert_eq!(
-        _mock_service.prepare_call_count.load(std::sync::atomic::Ordering::SeqCst),
+        _mock_service
+            .prepare_call_count
+            .load(std::sync::atomic::Ordering::SeqCst),
         0
     );
 }
@@ -1861,12 +1939,16 @@ async fn test_execute_query_explicit_with_type_bypasses_inference_guard() {
     let _stream = client.execute_query(request).await.unwrap();
 
     assert_eq!(
-        mock_service.prepare_call_count.load(std::sync::atomic::Ordering::SeqCst),
+        mock_service
+            .prepare_call_count
+            .load(std::sync::atomic::Ordering::SeqCst),
         1,
         "PrepareQuery should be called — explicit types bypass the inference guard"
     );
     assert_eq!(
-        mock_service.execute_call_count.load(std::sync::atomic::Ordering::SeqCst),
+        mock_service
+            .execute_call_count
+            .load(std::sync::atomic::Ordering::SeqCst),
         1
     );
 }
@@ -1899,7 +1981,9 @@ async fn test_prepare_query_different_app_profile_ids_get_independent_cache_entr
     let resp_a = client.prepare_query(req_a).await.unwrap();
     assert_eq!(resp_a.prepared_query, b"token_a");
     assert_eq!(
-        mock_service.prepare_call_count.load(std::sync::atomic::Ordering::SeqCst),
+        mock_service
+            .prepare_call_count
+            .load(std::sync::atomic::Ordering::SeqCst),
         1
     );
 
@@ -1922,11 +2006,17 @@ async fn test_prepare_query_different_app_profile_ids_get_independent_cache_entr
 
     // Verify both entries exist independently in the cache.
     assert!(
-        client.statement_cache().lookup_by_query(&sql, "profile_a").is_some(),
+        client
+            .statement_cache()
+            .lookup_by_query(&sql, "profile_a")
+            .is_some(),
         "profile_a entry must remain in cache"
     );
     assert!(
-        client.statement_cache().lookup_by_query(&sql, "profile_b").is_some(),
+        client
+            .statement_cache()
+            .lookup_by_query(&sql, "profile_b")
+            .is_some(),
         "profile_b entry must be independently cached"
     );
 
@@ -1940,8 +2030,295 @@ async fn test_prepare_query_different_app_profile_ids_get_independent_cache_entr
     let resp_a2 = client.prepare_query(req_a2).await.unwrap();
     assert_eq!(resp_a2.prepared_query, b"token_a");
     assert_eq!(
-        mock_service.prepare_call_count.load(std::sync::atomic::Ordering::SeqCst),
+        mock_service
+            .prepare_call_count
+            .load(std::sync::atomic::Ordering::SeqCst),
         2,
         "third call with profile_a must be a cache hit"
+    );
+}
+
+#[tokio::test]
+async fn test_concurrent_stampede_different_app_profiles() {
+    let (mock_service, client) = start_mock_server().await;
+    let sql = "SELECT * FROM table WHERE id = @id".to_string();
+
+    let mut params = std::collections::HashMap::new();
+    params.insert(
+        "id".to_string(),
+        googleapis_tonic_google_bigtable_v2::google::bigtable::v2::Value {
+            kind: Some(
+                googleapis_tonic_google_bigtable_v2::google::bigtable::v2::value::Kind::StringValue(
+                    "val".to_string(),
+                ),
+            ),
+            ..Default::default()
+        },
+    );
+
+    let mut handles = vec![];
+    // Spawn 25 tasks for profile_a
+    for _ in 0..25 {
+        let mut client_clone = client.clone();
+        let sql_clone = sql.clone();
+        let params_clone = params.clone();
+        handles.push(tokio::spawn(async move {
+            let request =
+                googleapis_tonic_google_bigtable_v2::google::bigtable::v2::ExecuteQueryRequest {
+                    instance_name: client_clone.instance_name().to_string(),
+                    app_profile_id: "profile_a".to_string(),
+                    query: sql_clone,
+                    params: params_clone,
+                    ..Default::default()
+                };
+            client_clone.execute_query(request).await.unwrap()
+        }));
+    }
+    // Spawn 25 tasks for profile_b
+    for _ in 0..25 {
+        let mut client_clone = client.clone();
+        let sql_clone = sql.clone();
+        let params_clone = params.clone();
+        handles.push(tokio::spawn(async move {
+            let request =
+                googleapis_tonic_google_bigtable_v2::google::bigtable::v2::ExecuteQueryRequest {
+                    instance_name: client_clone.instance_name().to_string(),
+                    app_profile_id: "profile_b".to_string(),
+                    query: sql_clone,
+                    params: params_clone,
+                    ..Default::default()
+                };
+            client_clone.execute_query(request).await.unwrap()
+        }));
+    }
+
+    for h in handles {
+        let _stream = h.await.unwrap();
+    }
+
+    // Assert exactly 2 PrepareQuery RPCs (one for each profile)
+    assert_eq!(
+        mock_service
+            .prepare_call_count
+            .load(std::sync::atomic::Ordering::SeqCst),
+        2
+    );
+}
+
+#[tokio::test]
+async fn test_concurrent_stampede_on_expired_token_recovery() {
+    let (mock_service, mut client) = start_mock_server().await;
+    let stmt = Arc::new(PreparedStatement::new(
+        "SELECT * FROM table".to_string(),
+        "default".to_string(),
+    ));
+
+    // 1. First prepare to populate cache
+    let plan = stmt.get_or_prepare(&mut client).await.unwrap();
+    assert_eq!(plan.plan_token, b"initial_token");
+    assert_eq!(
+        mock_service
+            .prepare_call_count
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+
+    // 2. Force client-side plan to expire
+    let expired_plan = Arc::new(
+        bigtable_rs::bigtable::prepared_statement::CompiledPlanState {
+            plan_token: b"initial_token".to_vec(),
+            expires_at: tokio::time::Instant::now() - std::time::Duration::from_secs(1),
+        },
+    );
+    stmt.plan_state().store(Some(expired_plan));
+
+    // 3. Spawn 50 concurrent executions on the expired token
+    *mock_service.next_prepare_token.lock().unwrap() = "recompiled_token".to_string();
+    let mut handles = vec![];
+    for _ in 0..50 {
+        let stmt_clone = stmt.clone();
+        let mut client_clone = client.clone();
+        handles.push(tokio::spawn(async move {
+            stmt_clone.get_or_prepare(&mut client_clone).await.unwrap()
+        }));
+    }
+
+    for h in handles {
+        let p = h.await.unwrap();
+        assert_eq!(p.plan_token, b"recompiled_token");
+    }
+
+    // Exactly 1 initial + exactly 1 re-prepare = 2 prepares total!
+    assert_eq!(
+        mock_service
+            .prepare_call_count
+            .load(std::sync::atomic::Ordering::SeqCst),
+        2
+    );
+}
+
+#[tokio::test]
+async fn test_persistent_expired_plan_bubbles_error() {
+    let (mock_service, mut client) = start_mock_server().await;
+    let stmt = PreparedStatement::new("SELECT * FROM table".to_string(), "default".to_string());
+
+    // Configure mock server to persistently reject prepared queries
+    mock_service
+        .execute_always_expire
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+
+    // Execute query — should retry up to limit and bubble error
+    let res = stmt
+        .execute_with_retry(&mut client, std::collections::HashMap::new())
+        .await;
+    assert!(res.is_err());
+
+    // Initial prepare (1) + nested reactive retries = 9 prepares total!
+    assert_eq!(
+        mock_service
+            .prepare_call_count
+            .load(std::sync::atomic::Ordering::SeqCst),
+        9
+    );
+    // 1 initial ExecuteQuery + retries = 9 total ExecuteQuery calls!
+    assert_eq!(
+        mock_service
+            .execute_call_count
+            .load(std::sync::atomic::Ordering::SeqCst),
+        9
+    );
+}
+
+#[tokio::test]
+async fn test_transient_compilation_failure_recovery() {
+    let (mock_service, mut client) = start_mock_server().await;
+    let stmt = PreparedStatement::new("SELECT * FROM table".to_string(), "default".to_string());
+
+    // Inject one-time PrepareQuery failure
+    mock_service
+        .prepare_fail_count
+        .store(1, std::sync::atomic::Ordering::SeqCst);
+    *mock_service.prepare_error_status.lock().unwrap() =
+        Some(tonic::Status::unavailable("Transient failure"));
+
+    // First call fails
+    let res1 = stmt.get_or_prepare(&mut client).await;
+    assert!(res1.is_err());
+
+    // Next call succeeds as error is cleared
+    let res2 = stmt.get_or_prepare(&mut client).await;
+    assert!(res2.is_ok());
+    assert_eq!(res2.unwrap().plan_token, b"initial_token");
+
+    assert_eq!(
+        mock_service
+            .prepare_call_count
+            .load(std::sync::atomic::Ordering::SeqCst),
+        2
+    );
+}
+
+#[tokio::test]
+async fn test_proactive_refresh_slow_network_response() {
+    let _ = env_logger::try_init();
+    let (mock_service, mut client) = start_mock_server().await;
+    tokio::time::pause();
+
+    mock_service
+        .next_prepare_ttl_secs
+        .store(30, std::sync::atomic::Ordering::SeqCst);
+
+    // Inject a delay on the next PrepareQuery RPC (during proactive background refresh)
+    *mock_service.prepare_delay.lock().unwrap() = Some(Duration::from_secs(10));
+
+    // First execution establishes the plan
+    let stmt = PreparedStatement::new("SELECT * FROM table".to_string(), "default".to_string());
+    let _stream = stmt
+        .execute_with_retry(&mut client, std::collections::HashMap::new())
+        .await
+        .unwrap();
+
+    let plan_v1 = stmt.plan_state().load_full().unwrap();
+    assert_eq!(plan_v1.plan_token, b"initial_token");
+
+    // Advance time to proactive refresh trigger (offset is 20% of 30s = 6s, trigger is at 24s)
+    tokio::time::advance(Duration::from_secs(24)).await;
+    // Execute query to mark used/active
+    let _stream2 = stmt
+        .execute_with_retry(&mut client, std::collections::HashMap::new())
+        .await
+        .unwrap();
+    tokio::task::yield_now().await;
+
+    // Warp time past the 30s original plan expiration (e.g., to 32s) while refresh is in-flight
+    *mock_service.next_prepare_token.lock().unwrap() = "token_v2".to_string();
+    tokio::time::advance(Duration::from_secs(8)).await;
+
+    // Spawn a concurrent query thread. It must block on the `prepare_lock` rather than making a second PrepareQuery RPC!
+    let mut client_clone = client.clone();
+    let stmt_clone = stmt.clone();
+    let handle =
+        tokio::spawn(async move { stmt_clone.get_or_prepare(&mut client_clone).await.unwrap() });
+
+    tokio::task::yield_now().await;
+    let plan = handle.await.unwrap();
+    assert_eq!(plan.plan_token, b"token_v2");
+
+    // Exactly 1 initial prepare + exactly 1 proactive prepare (even though it was delayed) = 2 prepares total!
+    assert_eq!(
+        mock_service
+            .prepare_call_count
+            .load(std::sync::atomic::Ordering::SeqCst),
+        2
+    );
+}
+
+#[tokio::test]
+async fn test_proactive_refresh_pruning_after_reactive_retry() {
+    let _ = env_logger::try_init();
+    let (mock_service, mut client) = start_mock_server().await;
+    tokio::time::pause();
+
+    mock_service
+        .next_prepare_ttl_secs
+        .store(30, std::sync::atomic::Ordering::SeqCst);
+
+    let stmt = PreparedStatement::new("SELECT * FROM table".to_string(), "default".to_string());
+    let _stream = stmt
+        .execute_with_retry(&mut client, std::collections::HashMap::new())
+        .await
+        .unwrap();
+
+    // Token is initial_token. Trigger proactive task sleep.
+    tokio::task::yield_now().await;
+
+    // Expire the token reactively at 15 seconds (out-of-band)
+    tokio::time::advance(Duration::from_secs(15)).await;
+    *mock_service.next_prepare_token.lock().unwrap() = "reactive_token".to_string();
+    mock_service
+        .should_expire_on_execute
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+
+    // Execute query — reactive retry triggers and compiles reactive_token
+    let _stream2 = stmt
+        .execute_with_retry(&mut client, std::collections::HashMap::new())
+        .await
+        .unwrap();
+    let active_plan = stmt.plan_state().load_full().unwrap();
+    assert_eq!(active_plan.plan_token, b"reactive_token");
+
+    // Warp to 24s (proactive task original wake-up threshold).
+    // The task must wake up, see the plan expires in the future (due to reactive compile),
+    // and exit cleanly *without* issuing any RPC!
+    tokio::time::advance(Duration::from_secs(10)).await;
+    tokio::task::yield_now().await;
+
+    // Check prepare call count: 1 (initial) + 1 (reactive compile) = 2 total!
+    // Proactive task did NOT dispatch an RPC.
+    assert_eq!(
+        mock_service
+            .prepare_call_count
+            .load(std::sync::atomic::Ordering::SeqCst),
+        2
     );
 }

@@ -442,10 +442,10 @@ impl BigTableConnection {
     }
 
     /// Provide a convenient method to update the inner `BigtableClient` so a newly configured client can be set
-    pub fn configure_inner_client(
-        &mut self,
-        config_fn: fn(BigtableClient<AuthSvc>) -> BigtableClient<AuthSvc>,
-    ) {
+    pub fn configure_inner_client<F>(&mut self, config_fn: F)
+    where
+        F: FnOnce(BigtableClient<AuthSvc>) -> BigtableClient<AuthSvc>,
+    {
         self.client = config_fn(self.client.clone());
     }
 }
@@ -718,34 +718,36 @@ impl BigTable {
         //    the token they passed is no longer the current one.
         let mut token_to_use = request.prepared_query.clone();
 
-        let cached_stmt: Option<Arc<prepared_statement::PreparedStatementInner>> =
-            if !token_to_use.is_empty() && request.query.is_empty() {
-                if let Some(stmt) = self.statement_cache.lookup_by_token(&token_to_use) {
-                    // Record the current time as the last-used timestamp for this statement.
-                    if let Some(elapsed) =
-                        tokio::time::Instant::now().checked_duration_since(stmt.base_instant)
-                    {
-                        stmt.last_executed_seconds
-                            .store(elapsed.as_secs(), std::sync::atomic::Ordering::Relaxed);
-                    }
-
-                    // If the background task has already refreshed the plan and stored a
-                    // newer token, upgrade transparently. The caller's token may be stale
-                    // but is still valid on the server for a short grace period, so this
-                    // upgrade is an optimization, not a requirement.
-                    if let Some(latest_plan) = stmt.plan_state.load_full() {
-                        if latest_plan.plan_token != token_to_use {
-                            log::info!("Transparently swapping stale prepared query token with proactively refreshed token");
-                            token_to_use = latest_plan.plan_token.clone();
-                        }
-                    }
-                    Some(stmt)
-                } else {
-                    None
+        let cached_stmt: Option<Arc<prepared_statement::PreparedStatementInner>> = if !token_to_use
+            .is_empty()
+            && request.query.is_empty()
+        {
+            if let Some(stmt) = self.statement_cache.lookup_by_token(&token_to_use) {
+                // Record the current time as the last-used timestamp for this statement.
+                if let Some(elapsed) =
+                    tokio::time::Instant::now().checked_duration_since(stmt.base_instant)
+                {
+                    stmt.last_executed_seconds
+                        .store(elapsed.as_secs(), std::sync::atomic::Ordering::Relaxed);
                 }
+
+                // If the background task has already refreshed the plan and stored a
+                // newer token, upgrade transparently. The caller's token may be stale
+                // but is still valid on the server for a short grace period, so this
+                // upgrade is an optimization, not a requirement.
+                if let Some(latest_plan) = stmt.plan_state.load_full() {
+                    if latest_plan.plan_token != token_to_use {
+                        log::info!("Transparently swapping stale prepared query token with proactively refreshed token");
+                        token_to_use = latest_plan.plan_token.clone();
+                    }
+                }
+                Some(stmt)
             } else {
                 None
-            };
+            }
+        } else {
+            None
+        };
 
         // --- Execute with retry on server-side expiry ---
         // Send the ExecuteQuery RPC. On success, stream the results back to the caller.
@@ -776,7 +778,8 @@ impl BigTable {
                     return Ok(resp.into_inner());
                 }
                 Err(status)
-                    if status.code() == tonic::Code::InvalidArgument
+                    if (status.code() == tonic::Code::FailedPrecondition
+                        || status.code() == tonic::Code::InvalidArgument)
                         && status.message().contains("PREPARED_QUERY_EXPIRED") =>
                 {
                     if retry_count >= 2 {
@@ -881,33 +884,39 @@ impl BigTable {
         // issued. The second thread finds the entry already in the cache and waits for
         // the first thread's compilation to finish via the per-statement prepare_lock
         // inside get_or_prepare.
-        let statement = self.statement_cache.get_or_insert_query(&query, &app_profile_id, || {
-            // Convert the protobuf parameter type descriptors from the request into the
-            // internal SqlType representation used by the cache. Unknown types fall back
-            // to Bytes so compilation is never blocked by an unrecognised type tag.
-            let param_types = request
-                .param_types
-                .iter()
-                .map(|(k, v)| {
-                    (
-                        k.clone(),
-                        crate::bigtable::sql::SqlType::from_pb(v)
-                            .unwrap_or(crate::bigtable::sql::SqlType::Bytes),
-                    )
-                })
-                .collect::<std::collections::HashMap<_, _>>();
+        // Pre-validate and convert all parameter types from the request upfront.
+        // Any unrecognized type or invalid nested schema triggers an immediate
+        // ParameterTypeInferenceFailed error, rather than silently coercing to Bytes.
+        let mut param_types = std::collections::HashMap::new();
+        for (k, v) in &request.param_types {
+            let sql_type = crate::bigtable::sql::SqlType::from_pb(v).ok_or_else(|| {
+                Error::ParameterTypeInferenceFailed(
+                    k.clone(),
+                    "Failed to parse or validate parameter type schema".to_owned(),
+                )
+            })?;
+            param_types.insert(k.clone(), sql_type);
+        }
 
-            Arc::new(prepared_statement::PreparedStatementInner {
-                query: query.clone(),
-                app_profile_id: app_profile_id.clone(),
-                param_types,
-                plan_state: arc_swap::ArcSwapOption::empty(),      // no plan compiled yet
-                prepare_lock: tokio::sync::Mutex::new(()),          // serialises concurrent compiles
-                base_instant: tokio::time::Instant::now(),          // reference point for idle tracking
-                last_executed_seconds: std::sync::atomic::AtomicU64::new(0),
-                cache: Arc::downgrade(&self.statement_cache),       // back-reference for cache cleanup on drop
-            })
-        });
+        let param_types_clone = param_types.clone();
+        let statement = self
+            .statement_cache
+            .get_or_insert_query(&query, &app_profile_id, || {
+                Arc::new(prepared_statement::PreparedStatementInner {
+                    query: query.clone(),
+                    app_profile_id: app_profile_id.clone(),
+                    param_types: param_types_clone,
+                    plan_state: arc_swap::ArcSwapOption::empty(), // no plan compiled yet
+                    prepare_lock: tokio::sync::Mutex::new(()),    // serialises concurrent compiles
+                    base_instant: tokio::time::Instant::now(), // reference point for idle tracking
+                    last_executed_seconds: std::sync::atomic::AtomicU64::new(0),
+                    cache: {
+                        let c = std::sync::OnceLock::new();
+                        let _ = c.set(Arc::downgrade(&self.statement_cache));
+                        c
+                    },
+                })
+            });
 
         // Compile the query if no valid plan is cached yet, or return the cached plan
         // if one exists and has not expired. This call is thread-safe: if multiple
@@ -949,10 +958,10 @@ impl BigTable {
     }
 
     /// Provide a convenient method to update the inner `BigtableClient` config
-    pub fn configure_inner_client(
-        &mut self,
-        config_fn: fn(BigtableClient<AuthSvc>) -> BigtableClient<AuthSvc>,
-    ) {
+    pub fn configure_inner_client<F>(&mut self, config_fn: F)
+    where
+        F: FnOnce(BigtableClient<AuthSvc>) -> BigtableClient<AuthSvc>,
+    {
         self.client = config_fn(self.client.clone());
     }
 
@@ -1023,6 +1032,16 @@ mod tests {
     fn test_infer_type_from_bytes() {
         let value = Value {
             kind: Some(Kind::BytesValue(vec![1, 2, 3])),
+            ..Default::default()
+        };
+        let t = infer_type_from_value(&value).unwrap();
+        assert!(matches!(t.kind, Some(TypeKind::BytesType(_))));
+    }
+
+    #[test]
+    fn test_infer_type_from_raw_value() {
+        let value = Value {
+            kind: Some(Kind::RawValue(vec![1, 2, 3])),
             ..Default::default()
         };
         let t = infer_type_from_value(&value).unwrap();

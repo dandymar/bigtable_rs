@@ -76,6 +76,10 @@ impl SqlType {
             TypeKind::ArrayType(arr) => {
                 let element = arr.element_type.as_ref()?;
                 let parsed_element = SqlType::from_pb(element)?;
+                // Validate: Array of Arrays is invalid/rejected by Bigtable SQL
+                if matches!(parsed_element, SqlType::Array(_)) {
+                    return None;
+                }
                 Some(SqlType::Array(Box::new(parsed_element)))
             }
             TypeKind::StructType(st) => {
@@ -92,6 +96,13 @@ impl SqlType {
                 let v_type = m.value_type.as_ref()?;
                 let parsed_k = SqlType::from_pb(k_type)?;
                 let parsed_v = SqlType::from_pb(v_type)?;
+                // Validate: Map key type must be primitive scalar (not Map, Struct, or Array)
+                if matches!(
+                    parsed_k,
+                    SqlType::Array(_) | SqlType::Struct(_) | SqlType::Map { .. }
+                ) {
+                    return None;
+                }
                 Some(SqlType::Map {
                     key_type: Box::new(parsed_k),
                     value_type: Box::new(parsed_v),
@@ -126,11 +137,7 @@ mod tests {
         let pb = sql_type.clone().to_pb();
         let recovered = SqlType::from_pb(&pb)
             .unwrap_or_else(|| panic!("from_pb returned None for {:?}", sql_type));
-        assert_eq!(
-            recovered, sql_type,
-            "roundtrip mismatch for {:?}",
-            sql_type
-        );
+        assert_eq!(recovered, sql_type, "roundtrip mismatch for {:?}", sql_type);
     }
 
     #[test]
@@ -149,10 +156,16 @@ mod tests {
     fn to_pb_from_pb_roundtrip_array() {
         roundtrip(SqlType::Array(Box::new(SqlType::String)));
         roundtrip(SqlType::Array(Box::new(SqlType::Int64)));
-        // Nested arrays
-        roundtrip(SqlType::Array(Box::new(SqlType::Array(Box::new(
-            SqlType::Bool,
-        )))));
+    }
+
+    #[test]
+    fn nested_array_returns_none_on_from_pb() {
+        let nested = SqlType::Array(Box::new(SqlType::Array(Box::new(SqlType::Bool))));
+        let pb = nested.to_pb();
+        assert!(
+            SqlType::from_pb(&pb).is_none(),
+            "Nested arrays must be rejected"
+        );
     }
 
     #[test]
@@ -176,6 +189,19 @@ mod tests {
             key_type: Box::new(SqlType::Bytes),
             value_type: Box::new(SqlType::Bool),
         });
+    }
+
+    #[test]
+    fn map_invalid_key_type_returns_none_on_from_pb() {
+        let invalid_map = SqlType::Map {
+            key_type: Box::new(SqlType::Array(Box::new(SqlType::String))),
+            value_type: Box::new(SqlType::Int64),
+        };
+        let pb = invalid_map.to_pb();
+        assert!(
+            SqlType::from_pb(&pb).is_none(),
+            "Maps with complex key types must be rejected"
+        );
     }
 
     #[test]
@@ -204,7 +230,11 @@ mod tests {
     #[test]
     fn with_type_attaches_type_descriptor_to_value() {
         let value = Value {
-            kind: Some(googleapis_tonic_google_bigtable_v2::google::bigtable::v2::value::Kind::FloatValue(3.14)),
+            kind: Some(
+                googleapis_tonic_google_bigtable_v2::google::bigtable::v2::value::Kind::FloatValue(
+                    1.5,
+                ),
+            ),
             ..Default::default()
         };
         assert!(value.r#type.is_none());

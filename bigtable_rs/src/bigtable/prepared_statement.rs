@@ -27,9 +27,10 @@ fn ttl_from_valid_until(
         let secs = ts.seconds.max(0) as u64;
         let nanos = ts.nanos.max(0) as u32;
         let expires_wall = std::time::UNIX_EPOCH + Duration::new(secs, nanos);
+        let safety_ttl = std::time::Duration::from_secs(10);
         expires_wall
             .duration_since(std::time::SystemTime::now())
-            .unwrap_or(fallback)
+            .unwrap_or(safety_ttl)
     } else {
         fallback
     }
@@ -95,7 +96,11 @@ impl ClientStatementCache {
     }
 
     /// Looks up a statement by its (query, app_profile_id) pair.
-    pub fn lookup_by_query(&self, query: &str, app_profile_id: &str) -> Option<Arc<PreparedStatementInner>> {
+    pub fn lookup_by_query(
+        &self,
+        query: &str,
+        app_profile_id: &str,
+    ) -> Option<Arc<PreparedStatementInner>> {
         let mut _evicted_stmt: Option<Arc<PreparedStatementInner>> = None;
         let result = {
             let query_map = self.query_to_statement.read().unwrap();
@@ -163,7 +168,12 @@ impl ClientStatementCache {
     /// if no entry exists. The app_profile_id is part of the key because the same SQL compiled
     /// for different app profiles produces independent plans that route to different servers.
     /// This prevents duplicate statements on concurrent cache misses for the same key.
-    pub fn get_or_insert_query<F>(&self, query: &str, app_profile_id: &str, creator: F) -> Arc<PreparedStatementInner>
+    pub fn get_or_insert_query<F>(
+        &self,
+        query: &str,
+        app_profile_id: &str,
+        creator: F,
+    ) -> Arc<PreparedStatementInner>
     where
         F: FnOnce() -> Arc<PreparedStatementInner>,
     {
@@ -221,7 +231,7 @@ pub struct PreparedStatementInner {
     /// Lock-free atomic elapsed seconds since base_instant when last executed
     pub last_executed_seconds: AtomicU64,
     /// Weak reference to the parent cache to enable clean deregistration on drop
-    pub cache: Weak<ClientStatementCache>,
+    pub cache: std::sync::OnceLock<std::sync::Weak<ClientStatementCache>>,
 }
 
 /// Exposes a prepared query statement handle. The cache is decentralized
@@ -253,7 +263,7 @@ impl PreparedStatement {
                 prepare_lock: AsyncMutex::new(()),
                 base_instant,
                 last_executed_seconds: AtomicU64::new(0),
-                cache: Weak::new(),
+                cache: std::sync::OnceLock::new(),
             }),
         }
     }
@@ -315,10 +325,16 @@ impl PreparedStatement {
         // get_or_insert_query is used (not insert_query) so that if another inner is
         // already registered for this query we don't clobber it — we just ensure ours
         // is present if the slot is empty.
+        let _ = self
+            .inner
+            .cache
+            .set(Arc::downgrade(&client.statement_cache));
         let inner_for_cache = Arc::clone(&self.inner);
-        client
-            .statement_cache
-            .get_or_insert_query(&self.inner.query, &self.inner.app_profile_id, || inner_for_cache);
+        client.statement_cache.get_or_insert_query(
+            &self.inner.query,
+            &self.inner.app_profile_id,
+            || inner_for_cache,
+        );
 
         // 3. Execute gRPC PrepareQuery
         let compiled_state = self.prepare_query_rpc(client).await?;
@@ -367,10 +383,8 @@ impl PreparedStatement {
             .map_err(Error::RpcError)?
             .into_inner();
 
-        let ttl_duration = ttl_from_valid_until(
-            response.valid_until,
-            std::time::Duration::from_secs(3600),
-        );
+        let ttl_duration =
+            ttl_from_valid_until(response.valid_until, std::time::Duration::from_secs(3600));
 
         // Enforce a safety floor duration (minimum 10 seconds) to protect against rapid tight-loops
         let ttl_duration = std::cmp::max(ttl_duration, std::time::Duration::from_secs(10));
@@ -517,6 +531,23 @@ impl PreparedStatement {
                         inner.query,
                         e
                     );
+                    // Reschedule after a cooldown delay (10s, or 2s for short-lived plans)
+                    let cooldown = if ttl > Duration::from_secs(30) {
+                        Duration::from_secs(10)
+                    } else {
+                        Duration::from_secs(2)
+                    };
+                    let offset = if ttl > Duration::from_secs(300) {
+                        Duration::from_secs(60)
+                    } else {
+                        ttl / 5
+                    };
+                    let next_expires_at = Instant::now() + cooldown + offset;
+                    stmt_handle.schedule_proactive_refresh(
+                        client.clone(),
+                        ttl, // Pass the original TTL to keep the idle check large and correct
+                        next_expires_at,
+                    );
                 }
             }
         });
@@ -572,7 +603,8 @@ impl PreparedStatement {
             match client.execute_query(execute_request).await {
                 Ok(stream) => return Ok(stream),
                 Err(Error::RpcError(status))
-                    if status.code() == tonic::Code::InvalidArgument
+                    if (status.code() == tonic::Code::FailedPrecondition
+                        || status.code() == tonic::Code::InvalidArgument)
                         && status.message().contains("PREPARED_QUERY_EXPIRED") =>
                 {
                     if retry_count >= 2 {
@@ -600,23 +632,25 @@ impl PreparedStatement {
 
 impl Drop for PreparedStatementInner {
     fn drop(&mut self) {
-        if let Some(cache) = self.cache.upgrade() {
-            // Remove from query map using the composite (query, app_profile_id) key
-            {
-                let key = (self.query.clone(), self.app_profile_id.clone());
-                let mut query_map = cache.query_to_statement.write().unwrap();
-                if let Some(weak_ref) = query_map.get(&key) {
-                    if weak_ref.strong_count() == 0 {
-                        query_map.remove(&key);
+        if let Some(weak_cache) = self.cache.get() {
+            if let Some(cache) = weak_cache.upgrade() {
+                // Remove from query map using the composite (query, app_profile_id) key
+                {
+                    let key = (self.query.clone(), self.app_profile_id.clone());
+                    let mut query_map = cache.query_to_statement.write().unwrap();
+                    if let Some(weak_ref) = query_map.get(&key) {
+                        if weak_ref.strong_count() == 0 {
+                            query_map.remove(&key);
+                        }
                     }
                 }
-            }
-            // Remove from token map if plan token exists
-            if let Some(plan) = self.plan_state.load_full() {
-                let mut token_map = cache.token_to_statement.write().unwrap();
-                if let Some(weak_ref) = token_map.get(&plan.plan_token) {
-                    if weak_ref.strong_count() == 0 {
-                        token_map.remove(&plan.plan_token);
+                // Remove from token map if plan token exists
+                if let Some(plan) = self.plan_state.load_full() {
+                    let mut token_map = cache.token_to_statement.write().unwrap();
+                    if let Some(weak_ref) = token_map.get(&plan.plan_token) {
+                        if weak_ref.strong_count() == 0 {
+                            token_map.remove(&plan.plan_token);
+                        }
                     }
                 }
             }
@@ -670,7 +704,11 @@ mod tests {
 
         let ttl = ttl_from_valid_until(Some(ts), fallback);
 
-        assert_eq!(ttl, fallback, "past timestamp should return the fallback duration");
+        assert_eq!(
+            ttl,
+            Duration::from_secs(10),
+            "past timestamp should return the 10-second safety TTL floor"
+        );
     }
 
     #[test]
@@ -687,14 +725,17 @@ mod tests {
         // A value of 30 as a Unix timestamp means Jan 1 1970 + 30s — firmly in the past.
         // Correct behaviour: return the fallback.
         // Buggy behaviour: return Duration::new(30, 0) = 30s.
-        let ts = prost_types::Timestamp { seconds: 30, nanos: 0 };
+        let ts = prost_types::Timestamp {
+            seconds: 30,
+            nanos: 0,
+        };
         let fallback = Duration::from_secs(3600);
 
         let ttl = ttl_from_valid_until(Some(ts), fallback);
 
         assert_eq!(
-            ttl, fallback,
-            "seconds=30 is a Unix timestamp from 1970, not a 30s duration — should use fallback"
+            ttl, Duration::from_secs(10),
+            "seconds=30 is a Unix timestamp from 1970, not a 30s duration — should use 10-second safety TTL floor"
         );
     }
 
@@ -704,7 +745,10 @@ mod tests {
         // Old bug: Duration::new(1_800_000_000, 0) ≈ 57 years.
         // Correct: that timestamp is ~1 year in the future from mid-2026, so TTL ≈ 1 year.
         // Either way the result must be far less than 57 years.
-        let ts = prost_types::Timestamp { seconds: 1_800_000_000, nanos: 0 };
+        let ts = prost_types::Timestamp {
+            seconds: 1_800_000_000,
+            nanos: 0,
+        };
         let fallback = Duration::from_secs(3600);
 
         let ttl = ttl_from_valid_until(Some(ts), fallback);
