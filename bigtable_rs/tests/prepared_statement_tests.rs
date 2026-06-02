@@ -363,8 +363,10 @@ async fn test_proactive_background_refresh_rotation() {
         .execute_with_retry(&mut client, std::collections::HashMap::new())
         .await
         .unwrap();
-    tokio::task::yield_now().await;
-    tokio::time::advance(Duration::from_secs(3)).await;
+    let remaining = (expires_at - offset)
+        .checked_duration_since(tokio::time::Instant::now())
+        .unwrap_or_default();
+    tokio::time::advance(remaining + Duration::from_secs(1)).await;
 
     let mut success = false;
     for _i in 0..100 {
@@ -400,8 +402,13 @@ async fn test_prepared_statement_idle_pollution_guard() {
 
     *mock_service.next_prepare_token.lock().unwrap() = "token_v2".to_string();
 
-    tokio::time::advance(Duration::from_secs(3541)).await;
-    tokio::time::sleep(Duration::from_secs(10)).await;
+    let ttl_secs = 3600u64;
+    let offset = Duration::from_secs(ttl_secs / 5);
+    let expires_at = plan_v1.expires_at;
+    let time_to_refresh = (expires_at - offset)
+        .checked_duration_since(tokio::time::Instant::now())
+        .unwrap_or_default();
+    tokio::time::advance(time_to_refresh + Duration::from_secs(5)).await;
 
     let active_plan = stmt.plan_state().load_full().unwrap();
     assert_eq!(active_plan.plan_token, b"initial_token");
@@ -585,8 +592,10 @@ async fn test_client_proactive_refresh_under_paused_time() {
     let pre_refresh_advance = time_to_refresh.saturating_sub(Duration::from_secs(2));
     tokio::time::advance(pre_refresh_advance).await;
     let _stream2 = client.execute_query(request.clone()).await.unwrap();
-    tokio::task::yield_now().await;
-    tokio::time::advance(Duration::from_secs(3)).await;
+    let remaining = (expires_at - offset)
+        .checked_duration_since(tokio::time::Instant::now())
+        .unwrap_or_default();
+    tokio::time::advance(remaining + Duration::from_secs(1)).await;
 
     let mut success = false;
     for _ in 0..100 {
@@ -769,8 +778,10 @@ async fn test_client_raw_query_proactive_refresh() {
     let pre_refresh_advance = time_to_refresh.saturating_sub(Duration::from_secs(2));
     tokio::time::advance(pre_refresh_advance).await;
     let _stream2 = client.execute_query(request.clone()).await.unwrap();
-    tokio::task::yield_now().await;
-    tokio::time::advance(Duration::from_secs(3)).await;
+    let remaining = (expires_at - offset)
+        .checked_duration_since(tokio::time::Instant::now())
+        .unwrap_or_default();
+    tokio::time::advance(remaining + Duration::from_secs(1)).await;
 
     let mut success = false;
     for _ in 0..100 {
@@ -987,8 +998,10 @@ async fn test_token_pruning_leak_safety() {
     let pre_refresh_advance = time_to_refresh.saturating_sub(Duration::from_secs(2));
     tokio::time::advance(pre_refresh_advance).await;
     let _stream2 = client.execute_query(request.clone()).await.unwrap();
-    tokio::task::yield_now().await;
-    tokio::time::advance(Duration::from_secs(3)).await;
+    let remaining = (expires_at - offset)
+        .checked_duration_since(tokio::time::Instant::now())
+        .unwrap_or_default();
+    tokio::time::advance(remaining + Duration::from_secs(1)).await;
 
     let mut success = false;
     for _ in 0..100 {
@@ -1005,8 +1018,12 @@ async fn test_token_pruning_leak_safety() {
     }
     assert!(success);
 
-    // Advance past the 10s grace period for old token cleanup
-    tokio::time::advance(Duration::from_secs(11)).await;
+    let completion_time = tokio::time::Instant::now();
+    let grace_advance = (completion_time + Duration::from_secs(10))
+        .checked_duration_since(tokio::time::Instant::now())
+        .unwrap_or_default()
+        + Duration::from_secs(1);
+    tokio::time::advance(grace_advance).await;
     tokio::task::yield_now().await;
 
     assert!(client
@@ -1057,7 +1074,13 @@ async fn test_weak_reference_cleanup_and_lru() {
             .unwrap()
     };
 
-    assert!(weak_stmt.upgrade().is_some());
+    let expires_at = weak_stmt
+        .upgrade()
+        .expect("statement should still be alive")
+        .plan_state
+        .load_full()
+        .expect("plan should be set")
+        .expires_at;
 
     {
         let mut lru = client.statement_cache().active_lru.lock().unwrap();
@@ -1066,7 +1089,12 @@ async fn test_weak_reference_cleanup_and_lru() {
 
     tokio::task::yield_now().await;
 
-    tokio::time::advance(Duration::from_secs(24)).await;
+    let ttl_secs = 30u64;
+    let offset = Duration::from_secs(ttl_secs / 5);
+    let time_to_refresh = (expires_at - offset)
+        .checked_duration_since(tokio::time::Instant::now())
+        .unwrap_or_default();
+    tokio::time::advance(time_to_refresh + Duration::from_secs(1)).await;
     tokio::task::yield_now().await;
 
     assert!(
@@ -1263,8 +1291,10 @@ async fn test_client_prepare_bind_execute_transparent_swap() {
     let _stream_init2 = client.execute_query(execute_req_init).await.unwrap();
     tokio::task::yield_now().await;
 
-    // 3. Advance past the refresh threshold to trigger proactive background rotation
-    tokio::time::advance(Duration::from_secs(2)).await;
+    let remaining = (expires_at - offset)
+        .checked_duration_since(tokio::time::Instant::now())
+        .unwrap_or_default();
+    tokio::time::advance(remaining + Duration::from_secs(1)).await;
 
     // 4. Yield and assert cache mapping for b"token_v2" is registered successfully
     let mut success = false;
@@ -2277,7 +2307,10 @@ async fn test_proactive_refresh_slow_network_response() {
         .await
         .unwrap();
 
-    tokio::time::advance(Duration::from_secs(3)).await; // cross the refresh threshold
+    let remaining = (plan_v1.expires_at - offset)
+        .checked_duration_since(tokio::time::Instant::now())
+        .unwrap_or_default();
+    tokio::time::advance(remaining + Duration::from_secs(1)).await; // cross the refresh threshold
 
     // Avoid Bug C (TCP Loopback Dispatch Race): deterministic polling loop for prepare_call_count to become 2
     let mut success = false;
@@ -2297,9 +2330,11 @@ async fn test_proactive_refresh_slow_network_response() {
         "prepare_call_count did not reach 2 within the polling loop"
     );
 
-    // Advance past the plan's client-side expiry so the concurrent get_or_prepare
-    // takes the slow path and must wait on the prepare_lock held by the background task.
-    tokio::time::advance(offset + Duration::from_secs(1)).await;
+    let time_to_expiry = plan_v1
+        .expires_at
+        .checked_duration_since(tokio::time::Instant::now())
+        .unwrap_or_default();
+    tokio::time::advance(time_to_expiry + Duration::from_secs(1)).await;
 
     // Spawn the concurrent query thread. It must block on the `prepare_lock` rather than making a second PrepareQuery RPC!
     let mut client_clone = client.clone();
@@ -2312,10 +2347,11 @@ async fn test_proactive_refresh_slow_network_response() {
         tokio::task::yield_now().await;
     }
 
-    // Before awaiting handle, explicitly advance virtual time by another 3 seconds (taking the clock to 45s)
-    // to guarantee that the mock RPC's 10-second delay resolves, the proactive refresh releases the lock,
-    // and the concurrent thread can acquire the lock and complete deterministically.
-    tokio::time::advance(Duration::from_secs(3)).await;
+    let rpc_completion_target = (plan_v1.expires_at - offset) + Duration::from_secs(10);
+    let remaining_to_completion = rpc_completion_target
+        .checked_duration_since(tokio::time::Instant::now())
+        .unwrap_or_default();
+    tokio::time::advance(remaining_to_completion + Duration::from_secs(1)).await;
 
     let plan = handle.await.unwrap();
     assert_eq!(plan.plan_token, b"token_v2");
@@ -2379,10 +2415,10 @@ async fn test_proactive_refresh_pruning_after_reactive_retry() {
     let active_plan = stmt.plan_state().load_full().unwrap();
     assert_eq!(active_plan.plan_token, b"reactive_token");
 
-    // Advance past the proactive refresh threshold so the original background task
-    // wakes up. It must see reactive_token's far-future expires_at in the double-check
-    // and exit cleanly without issuing any RPC.
-    tokio::time::advance(Duration::from_secs(10)).await;
+    let remaining = (plan_v1.expires_at - offset)
+        .checked_duration_since(tokio::time::Instant::now())
+        .unwrap_or_default();
+    tokio::time::advance(remaining + Duration::from_secs(2)).await;
 
     // Yield multiple times to give the background task enough scheduling cycles to
     // run through its double-check path and return before we assert the count.
@@ -2479,7 +2515,10 @@ async fn test_execute_query_slow_response_does_not_cause_idle_guard_false_positi
 
     // Disable the execute delay and advance past the refresh threshold.
     *mock_service.execute_delay.lock().unwrap() = None;
-    tokio::time::advance(Duration::from_secs(3)).await;
+    let remaining = (expires_at - offset)
+        .checked_duration_since(tokio::time::Instant::now())
+        .unwrap_or_default();
+    tokio::time::advance(remaining + Duration::from_secs(1)).await;
 
     // Poll for the proactive refresh to complete and register token_v2.
     let mut success = false;
