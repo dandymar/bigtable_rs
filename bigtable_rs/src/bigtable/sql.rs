@@ -116,3 +116,107 @@ impl ValueExt for Value {
         self
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Helper: round-trip a SqlType through to_pb → from_pb and assert equality.
+    fn roundtrip(sql_type: SqlType) {
+        let pb = sql_type.clone().to_pb();
+        let recovered = SqlType::from_pb(&pb)
+            .unwrap_or_else(|| panic!("from_pb returned None for {:?}", sql_type));
+        assert_eq!(
+            recovered, sql_type,
+            "roundtrip mismatch for {:?}",
+            sql_type
+        );
+    }
+
+    #[test]
+    fn to_pb_from_pb_roundtrip_scalar_types() {
+        roundtrip(SqlType::String);
+        roundtrip(SqlType::Int64);
+        roundtrip(SqlType::Bool);
+        roundtrip(SqlType::Bytes);
+        roundtrip(SqlType::Float32);
+        roundtrip(SqlType::Float64);
+        roundtrip(SqlType::Timestamp);
+        roundtrip(SqlType::Date);
+    }
+
+    #[test]
+    fn to_pb_from_pb_roundtrip_array() {
+        roundtrip(SqlType::Array(Box::new(SqlType::String)));
+        roundtrip(SqlType::Array(Box::new(SqlType::Int64)));
+        // Nested arrays
+        roundtrip(SqlType::Array(Box::new(SqlType::Array(Box::new(
+            SqlType::Bool,
+        )))));
+    }
+
+    #[test]
+    fn to_pb_from_pb_roundtrip_struct() {
+        roundtrip(SqlType::Struct(vec![
+            ("name".to_string(), SqlType::String),
+            ("age".to_string(), SqlType::Int64),
+            ("active".to_string(), SqlType::Bool),
+        ]));
+        // Empty struct
+        roundtrip(SqlType::Struct(vec![]));
+    }
+
+    #[test]
+    fn to_pb_from_pb_roundtrip_map() {
+        roundtrip(SqlType::Map {
+            key_type: Box::new(SqlType::String),
+            value_type: Box::new(SqlType::Int64),
+        });
+        roundtrip(SqlType::Map {
+            key_type: Box::new(SqlType::Bytes),
+            value_type: Box::new(SqlType::Bool),
+        });
+    }
+
+    #[test]
+    fn to_pb_from_pb_roundtrip_nested_complex_types() {
+        // Array of structs
+        roundtrip(SqlType::Array(Box::new(SqlType::Struct(vec![
+            ("id".to_string(), SqlType::Int64),
+            ("label".to_string(), SqlType::String),
+        ]))));
+        // Map with array values
+        roundtrip(SqlType::Map {
+            key_type: Box::new(SqlType::String),
+            value_type: Box::new(SqlType::Array(Box::new(SqlType::Float64))),
+        });
+    }
+
+    #[test]
+    fn from_pb_returns_none_for_empty_kind() {
+        let pb = Type { kind: None };
+        assert!(
+            SqlType::from_pb(&pb).is_none(),
+            "from_pb should return None when kind is absent"
+        );
+    }
+
+    #[test]
+    fn with_type_attaches_type_descriptor_to_value() {
+        let value = Value {
+            kind: Some(googleapis_tonic_google_bigtable_v2::google::bigtable::v2::value::Kind::FloatValue(3.14)),
+            ..Default::default()
+        };
+        assert!(value.r#type.is_none());
+
+        let value_with_type = value.with_type(SqlType::Float64);
+        let attached = value_with_type.r#type.unwrap();
+        assert!(
+            matches!(
+                attached.kind,
+                Some(googleapis_tonic_google_bigtable_v2::google::bigtable::v2::r#type::Kind::Float64Type(_))
+            ),
+            "with_type should attach the Float64 type descriptor"
+        );
+    }
+}

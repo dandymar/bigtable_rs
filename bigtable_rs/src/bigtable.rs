@@ -613,22 +613,40 @@ impl BigTable {
         Ok(response)
     }
 
-    /// Wrapped `execute_query` method with transparent Prepared Query coercion.
+    /// Executes a SQL query against Bigtable, automatically handling query preparation
+    /// and plan token caching on behalf of the caller.
     ///
-    /// Wrapped `execute_query` method with transparent Prepared Query coercion and client-side caching.
+    /// There are two ways to call this method:
     ///
-    /// If `request.query` is not empty (direct SQL parameter invocation), the client library
-    /// will automatically intercept it, check the client-scoped cache, prepare if needed,
-    /// and execute, requiring zero changes in the user's application code.
+    /// **Raw SQL** — set `request.query` to a SQL string and `request.params` to the
+    /// parameter values. The library will call `prepare_query` internally on the first
+    /// call for that SQL string and cache the resulting compiled plan token. Subsequent
+    /// calls with the same SQL string skip the prepare step entirely and go straight to
+    /// execution, saving a network round-trip.
+    ///
+    /// **Pre-compiled token** — set `request.prepared_query` to a token previously
+    /// returned by `prepare_query`. The library will silently upgrade the token to a
+    /// newer one if the background refresh task has already rotated it, so callers do
+    /// not need to track token expiry themselves.
     #[allow(deprecated)]
     pub async fn execute_query(
         &mut self,
         mut request: ExecuteQueryRequest,
     ) -> Result<Streaming<ExecuteQueryResponse>> {
         let app_profile_id = request.app_profile_id.clone();
-        let mut cached_stmt: Option<Arc<prepared_statement::PreparedStatementInner>> = None;
 
-        // Case 2-A: Raw Query Execution (Bypass Coercion check / Use Case B)
+        // --- Raw SQL path ---
+        // The caller provided a SQL string and parameter values rather than a
+        // pre-compiled plan token. Before we can execute, Bigtable requires the query
+        // to be compiled into an opaque token via the PrepareQuery RPC. We do that here
+        // transparently so the caller never has to think about it.
+        //
+        // prepare_query checks the client-side cache first. If the same SQL string was
+        // compiled in a previous call, the cached token is returned immediately with no
+        // network round-trip. Only the very first call for a given SQL string hits the
+        // wire. After prepare_query returns, we swap the compiled token into the request
+        // and clear the raw SQL field so the rest of this method treats it identically
+        // to a request that arrived with a token already set.
         if !self.execute_query_with_prepare_disabled
             && !request.query.is_empty()
             && !request.params.is_empty()
@@ -639,19 +657,30 @@ impl BigTable {
                 request.query
             );
 
-            // 1. Infer parameter types from request params
+            // Build the parameter type map that PrepareQuery needs. For each parameter
+            // we first check whether the caller attached an explicit type annotation via
+            // ValueExt::with_type(); if so, we use it directly. Otherwise we attempt to
+            // infer the SQL type from the runtime value.
+            //
+            // Inference intentionally rejects ambiguous types (floats, nulls, arrays,
+            // structs, maps) and returns an error asking the caller to annotate with
+            // .with_type(). Sending the wrong type to the server would produce a
+            // confusing server-side error, so we surface the problem here instead.
             let mut param_types = std::collections::HashMap::new();
             for (param_name, value) in &request.params {
                 let pb_type = if let Some(val_type) = &value.r#type {
                     val_type.clone()
                 } else {
-                    infer_type_from_value(value).unwrap_or_else(|_| {
-                        googleapis_tonic_google_bigtable_v2::google::bigtable::v2::Type {
-                            kind: Some(googleapis_tonic_google_bigtable_v2::google::bigtable::v2::r#type::Kind::StringType(
-                                Default::default(),
-                            )),
+                    infer_type_from_value(value).map_err(|e| {
+                        // Attach the parameter name to the error so the caller knows
+                        // exactly which parameter needs an explicit type annotation.
+                        match e {
+                            Error::ParameterTypeInferenceFailed(_, msg) => {
+                                Error::ParameterTypeInferenceFailed(param_name.clone(), msg)
+                            }
+                            other => other,
                         }
-                    })
+                    })?
                 };
                 param_types.insert(param_name.clone(), pb_type);
             }
@@ -664,52 +693,73 @@ impl BigTable {
                 ..Default::default()
             };
 
-            // 2. Delegate to prepare_query under the hood (handles centralized caching)
             let prepare_resp = self.prepare_query(prepare_req).await?;
 
-            // 3. Populate cached_stmt from cache so telemetry/telemetry updates correctly
-            cached_stmt = self.statement_cache.lookup_by_query(&request.query);
-
-            // 4. Swap inline
+            // Replace the raw SQL with the compiled plan token. From this point on,
+            // the request looks the same as one submitted with a token from the start.
             request.prepared_query = prepare_resp.prepared_query;
             request.query.clear();
             request.data_format = None;
         }
 
+        // --- Token lookup and automatic upgrade ---
+        // At this point the request always contains a compiled plan token (either
+        // supplied by the caller or produced by the raw SQL path above). We look up
+        // the token in the cache to do two things before sending the request to the server:
+        //
+        // 1. Record that this statement was used right now. The background refresh task
+        //    uses this timestamp to decide whether a statement is still active. If a
+        //    statement has not been executed for a long time, the background task will
+        //    skip refreshing it to avoid wasting network calls on idle queries.
+        //
+        // 2. Check whether the background refresh task has already rotated to a newer
+        //    token. If so, we silently upgrade the token in the request so the server
+        //    receives the freshest available plan. The caller never needs to know that
+        //    the token they passed is no longer the current one.
         let mut token_to_use = request.prepared_query.clone();
 
-        // Case 2-B: Token-Bound Execution (Pre-prepared / Use Case A)
-        if !token_to_use.is_empty() && request.query.is_empty() {
-            if let Some(stmt) = self.statement_cache.lookup_by_token(&token_to_use) {
-                cached_stmt = Some(stmt.clone());
-                if let Some(elapsed) = tokio::time::Instant::now().checked_duration_since(stmt.base_instant) {
-                    stmt.last_executed_seconds.store(elapsed.as_secs(), std::sync::atomic::Ordering::Relaxed);
-                }
-                if let Some(latest_plan) = stmt.plan_state.load_full() {
-                    if latest_plan.plan_token != token_to_use {
-                        log::info!("Transparently swapping stale prepared query token with proactively refreshed token");
-                        token_to_use = latest_plan.plan_token.clone();
-                        request.prepared_query = token_to_use.clone();
+        let cached_stmt: Option<Arc<prepared_statement::PreparedStatementInner>> =
+            if !token_to_use.is_empty() && request.query.is_empty() {
+                if let Some(stmt) = self.statement_cache.lookup_by_token(&token_to_use) {
+                    // Record the current time as the last-used timestamp for this statement.
+                    if let Some(elapsed) =
+                        tokio::time::Instant::now().checked_duration_since(stmt.base_instant)
+                    {
+                        stmt.last_executed_seconds
+                            .store(elapsed.as_secs(), std::sync::atomic::Ordering::Relaxed);
                     }
-                }
-            }
-        }
 
+                    // If the background task has already refreshed the plan and stored a
+                    // newer token, upgrade transparently. The caller's token may be stale
+                    // but is still valid on the server for a short grace period, so this
+                    // upgrade is an optimization, not a requirement.
+                    if let Some(latest_plan) = stmt.plan_state.load_full() {
+                        if latest_plan.plan_token != token_to_use {
+                            log::info!("Transparently swapping stale prepared query token with proactively refreshed token");
+                            token_to_use = latest_plan.plan_token.clone();
+                        }
+                    }
+                    Some(stmt)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+        // --- Execute with retry on server-side expiry ---
+        // Send the ExecuteQuery RPC. On success, stream the results back to the caller.
+        // The server may occasionally reject a plan token with PREPARED_QUERY_EXPIRED,
+        // which means the server-side compiled plan has been invalidated (this is separate
+        // from the client-side expiry tracked by expires_at — the server can expire a plan
+        // early due to schema changes or rolling upgrades). When that happens we evict the
+        // stale token, recompile, and retry automatically. We allow up to two retries
+        // before giving up and returning the error to the caller.
         let mut retry_count = 0;
         loop {
-            if let Some(ref stmt) = cached_stmt {
-                if let Some(elapsed) =
-                    tokio::time::Instant::now().checked_duration_since(stmt.base_instant)
-                {
-                    stmt.last_executed_seconds
-                        .store(elapsed.as_secs(), std::sync::atomic::Ordering::Relaxed);
-                }
-            }
-
             let mut tonic_req = request.clone().into_request();
             if !token_to_use.is_empty() {
-                let req_inner = tonic_req.get_mut();
-                req_inner.prepared_query = token_to_use.clone();
+                tonic_req.get_mut().prepared_query = token_to_use.clone();
             }
 
             tonic_req.metadata_mut().insert(
@@ -734,48 +784,54 @@ impl BigTable {
                     }
                     log::warn!("Server-side plan expired (PREPARED_QUERY_EXPIRED). Evicting plan and retrying compile...");
 
-                    let stmt = if let Some(ref s) = cached_stmt {
-                        Some(s.clone())
-                    } else {
-                        self.statement_cache.lookup_by_token(&token_to_use)
-                    };
+                    // Find the cached statement for this token. We already have it from
+                    // the lookup above if the token was in the cache; otherwise search by
+                    // the token bytes directly as a fallback.
+                    let stmt = cached_stmt
+                        .clone()
+                        .or_else(|| self.statement_cache.lookup_by_token(&token_to_use));
 
+                    // Remove the expired token from the cache so no other concurrent
+                    // request picks it up and wastes a round-trip with the same bad token.
                     self.statement_cache.remove_token(&token_to_use);
 
                     if let Some(stmt) = stmt {
                         let current = stmt.plan_state.load();
                         if let Some(ref current_plan) = *current {
                             if current_plan.plan_token == token_to_use {
+                                // The cached plan still points to the expired token. Clear it
+                                // atomically so no other thread tries to use it, then recompile.
+                                stmt.plan_state.compare_and_swap(&current, None);
                                 let stmt_handle = prepared_statement::PreparedStatement {
                                     inner: stmt.clone(),
                                 };
-                                // Force eviction of the stale plan
-                                stmt.plan_state.compare_and_swap(&current, None);
                                 match stmt_handle.get_or_prepare(self).await {
-                                    Ok(new_plan) => {
-                                        token_to_use = new_plan.plan_token.clone();
-                                    }
-                                    Err(e) => {
-                                        return Err(e);
-                                    }
+                                    Ok(new_plan) => token_to_use = new_plan.plan_token.clone(),
+                                    Err(e) => return Err(e),
                                 }
                             } else {
+                                // The background refresh task already compiled a fresh token
+                                // while this request was in flight. Use that token for the retry
+                                // instead of issuing another PrepareQuery RPC.
                                 token_to_use = current_plan.plan_token.clone();
                             }
                         } else {
+                            // The plan slot is empty, meaning another concurrent caller already
+                            // evicted it. Call get_or_prepare which will recompile exactly once
+                            // even if multiple threads reach this point simultaneously.
                             let stmt_handle = prepared_statement::PreparedStatement {
                                 inner: stmt.clone(),
                             };
                             match stmt_handle.get_or_prepare(self).await {
-                                Ok(new_plan) => {
-                                    token_to_use = new_plan.plan_token.clone();
-                                }
-                                Err(e) => {
-                                    return Err(e);
-                                }
+                                Ok(new_plan) => token_to_use = new_plan.plan_token.clone(),
+                                Err(e) => return Err(e),
                             }
                         }
                     } else {
+                        // No cached statement found for this token. This can happen when
+                        // a token was created outside this client instance and the cache
+                        // has no record of it. Without a cached statement we cannot
+                        // recompile, so surface the error to the caller.
                         return Err(Error::RpcError(status));
                     }
 
@@ -786,7 +842,28 @@ impl BigTable {
         }
     }
 
-    /// Wrapped `prepare_query` method to support Phase 2 migration with client-side caching.
+    /// Compiles a SQL query into a reusable plan token, caching the result so that
+    /// repeated calls with the same SQL string do not re-compile.
+    ///
+    /// Bigtable's ExecuteQuery RPC requires a pre-compiled plan token rather than a
+    /// raw SQL string. Compiling a query (PrepareQuery) is relatively expensive — it
+    /// involves a network round-trip and server-side query planning. This method wraps
+    /// that process with a client-side cache so the cost is paid only once per unique
+    /// SQL string per client instance.
+    ///
+    /// The returned `PrepareQueryResponse` contains the compiled plan token and an
+    /// expiry timestamp. Callers may pass the token directly to `execute_query`, or
+    /// simply call `execute_query` with raw SQL and let it call this method automatically.
+    ///
+    /// # Cache key and param_types
+    ///
+    /// The cache is keyed on `(query, app_profile_id)`. The `param_types` field in the
+    /// request is stored only on the **first** call for a given key — subsequent calls
+    /// with the same SQL and app profile return the already-compiled plan regardless of
+    /// what `param_types` they supply. If you need to compile the same SQL with
+    /// different parameter types, use a distinct `app_profile_id` per variant, or call
+    /// `execute_query` with raw SQL (which will infer types automatically on each call
+    /// if the cache is cold, or reuse the cached plan if it is warm).
     pub async fn prepare_query(
         &mut self,
         request: PrepareQueryRequest,
@@ -794,8 +871,20 @@ impl BigTable {
         let query = request.query.clone();
         let app_profile_id = request.app_profile_id.clone();
 
-        // 1. Look up in query_to_statement cache
-        let statement = self.statement_cache.get_or_insert_query(&query, || {
+        // Look up the SQL string in the cache. If a compiled statement already exists
+        // for this exact query, the cached entry is returned immediately. If not, a new
+        // statement entry is created and inserted into the cache. The closure below is
+        // the factory that builds the new entry — it only runs on a cache miss.
+        //
+        // Storing the entry now (before the network call) means that if two threads call
+        // prepare_query for the same SQL at the same time, only one PrepareQuery RPC is
+        // issued. The second thread finds the entry already in the cache and waits for
+        // the first thread's compilation to finish via the per-statement prepare_lock
+        // inside get_or_prepare.
+        let statement = self.statement_cache.get_or_insert_query(&query, &app_profile_id, || {
+            // Convert the protobuf parameter type descriptors from the request into the
+            // internal SqlType representation used by the cache. Unknown types fall back
+            // to Bytes so compilation is never blocked by an unrecognised type tag.
             let param_types = request
                 .param_types
                 .iter()
@@ -808,33 +897,38 @@ impl BigTable {
                 })
                 .collect::<std::collections::HashMap<_, _>>();
 
-            let base_instant = tokio::time::Instant::now();
             Arc::new(prepared_statement::PreparedStatementInner {
                 query: query.clone(),
                 app_profile_id: app_profile_id.clone(),
                 param_types,
-                plan_state: arc_swap::ArcSwapOption::empty(),
-                prepare_lock: tokio::sync::Mutex::new(()),
-                base_instant,
+                plan_state: arc_swap::ArcSwapOption::empty(),      // no plan compiled yet
+                prepare_lock: tokio::sync::Mutex::new(()),          // serialises concurrent compiles
+                base_instant: tokio::time::Instant::now(),          // reference point for idle tracking
                 last_executed_seconds: std::sync::atomic::AtomicU64::new(0),
-                cache: Arc::downgrade(&self.statement_cache),
+                cache: Arc::downgrade(&self.statement_cache),       // back-reference for cache cleanup on drop
             })
         });
 
-        // 2. Get or compile the plan token
+        // Compile the query if no valid plan is cached yet, or return the cached plan
+        // if one exists and has not expired. This call is thread-safe: if multiple
+        // callers reach here concurrently for the same statement, only one issues the
+        // PrepareQuery RPC; the rest wait and then read the result from the shared
+        // plan_state field.
         let stmt_handle = prepared_statement::PreparedStatement {
             inner: statement.clone(),
         };
         let plan = stmt_handle.get_or_prepare(self).await?;
 
-        // 3. Return the compiled PrepareQueryResponse
+        // Build the response. The plan token is the opaque bytes the server returned.
+        // The valid_until timestamp tells callers when the token is expected to expire,
+        // expressed as an absolute wall-clock time (Unix epoch seconds) so it can be
+        // compared against the current time on any machine.
         let duration = plan
             .expires_at
             .checked_duration_since(tokio::time::Instant::now())
             .unwrap_or(std::time::Duration::from_secs(0));
-        let now = std::time::SystemTime::now();
-        let future = now + duration;
-        let dur_since_epoch = future
+        let expires_wall = std::time::SystemTime::now() + duration;
+        let dur_since_epoch = expires_wall
             .duration_since(std::time::SystemTime::UNIX_EPOCH)
             .unwrap_or(std::time::Duration::from_secs(0));
 
@@ -990,6 +1084,60 @@ mod tests {
         assert!(matches!(
             t.unwrap_err(),
             Error::ParameterTypeInferenceFailed(_, detail) if detail.contains("Null/None")
+        ));
+    }
+
+    #[test]
+    fn test_infer_type_from_timestamp() {
+        let value = Value {
+            kind: Some(Kind::TimestampValue(prost_types::Timestamp {
+                seconds: 1_700_000_000,
+                nanos: 0,
+            })),
+            ..Default::default()
+        };
+        let t = infer_type_from_value(&value).unwrap();
+        assert!(matches!(t.kind, Some(TypeKind::TimestampType(_))));
+    }
+
+    #[test]
+    fn test_infer_type_from_date() {
+        let value = Value {
+            kind: Some(Kind::DateValue(
+                googleapis_tonic_google_bigtable_v2::google::r#type::Date {
+                    year: 2024,
+                    month: 6,
+                    day: 1,
+                },
+            )),
+            ..Default::default()
+        };
+        let t = infer_type_from_value(&value).unwrap();
+        assert!(matches!(t.kind, Some(TypeKind::DateType(_))));
+    }
+
+    #[test]
+    fn test_infer_type_from_raw_timestamp_micros() {
+        let value = Value {
+            kind: Some(Kind::RawTimestampMicros(1_700_000_000_000_000)),
+            ..Default::default()
+        };
+        let t = infer_type_from_value(&value).unwrap();
+        assert!(matches!(t.kind, Some(TypeKind::Int64Type(_))));
+    }
+
+    #[test]
+    fn test_infer_type_from_array_value_rejection() {
+        use googleapis_tonic_google_bigtable_v2::google::bigtable::v2::ArrayValue;
+        let value = Value {
+            kind: Some(Kind::ArrayValue(ArrayValue::default())),
+            ..Default::default()
+        };
+        let t = infer_type_from_value(&value);
+        assert!(t.is_err());
+        assert!(matches!(
+            t.unwrap_err(),
+            Error::ParameterTypeInferenceFailed(_, detail) if detail.contains("ARRAY")
         ));
     }
 }
