@@ -42,6 +42,7 @@ struct CustomMockService {
     prepare_error_status: Arc<std::sync::Mutex<Option<tonic::Status>>>,
     execute_always_expire: Arc<std::sync::atomic::AtomicBool>,
     prepare_delay: Arc<std::sync::Mutex<Option<Duration>>>,
+    execute_delay: Arc<std::sync::Mutex<Option<Duration>>>,
 }
 
 impl Service<http::Request<hyper::body::Incoming>> for CustomMockService {
@@ -129,6 +130,12 @@ impl Service<http::Request<hyper::body::Incoming>> for CustomMockService {
                     .execute_call_count
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
+                // Handle optional execute delay (simulates a slow network response)
+                let delay = *self_clone.execute_delay.lock().unwrap();
+                if let Some(d) = delay {
+                    tokio::time::sleep(d).await;
+                }
+
                 use http_body_util::BodyExt;
                 use prost::Message;
                 let body = req.into_body();
@@ -208,6 +215,7 @@ async fn start_mock_server() -> (CustomMockService, BigTable) {
         prepare_error_status: Arc::new(std::sync::Mutex::new(None)),
         execute_always_expire: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         prepare_delay: Arc::new(std::sync::Mutex::new(None)),
+        execute_delay: Arc::new(std::sync::Mutex::new(None)),
     };
 
     let service_clone = service.clone();
@@ -376,9 +384,8 @@ async fn test_proactive_background_refresh_rotation() {
 
 #[tokio::test]
 async fn test_prepared_statement_idle_pollution_guard() {
-    tokio::time::pause();
-
     let (mock_service, mut client) = start_mock_server().await;
+    tokio::time::pause();
     let stmt = PreparedStatement::new("SELECT * FROM table".to_string(), "default".to_string());
 
     mock_service
@@ -1176,9 +1183,9 @@ async fn test_client_prepare_bind_execute_basic() {
 async fn test_client_prepare_bind_execute_transparent_swap() {
     use googleapis_tonic_google_bigtable_v2::google;
     let _ = env_logger::builder().is_test(true).try_init();
-    tokio::time::pause();
 
     let (mock_service, mut client) = start_mock_server().await;
+    tokio::time::pause();
 
     // 1. Pause virtual time. Call prepare_query to get b"initial_token" (TTL 30s)
     mock_service
@@ -2341,14 +2348,30 @@ async fn test_proactive_refresh_pruning_after_reactive_retry() {
     // Token is initial_token. Trigger proactive task sleep.
     tokio::task::yield_now().await;
 
-    // Expire the token reactively at 15 seconds (out-of-band)
-    tokio::time::advance(Duration::from_secs(15)).await;
+    // Compute actual refresh threshold from the compiled plan so the test is
+    // robust to any H2-connection-setup auto-advance during the initial compile.
+    let plan_v1 = stmt.plan_state().load_full().unwrap();
+    let ttl_secs = 30u64;
+    let offset = Duration::from_secs(ttl_secs / 5);
+    let now = tokio::time::Instant::now();
+    let time_to_refresh = (plan_v1.expires_at - offset)
+        .checked_duration_since(now)
+        .unwrap_or_default();
+
+    // Trigger the reactive retry before the proactive refresh threshold.
+    // Use a large TTL for the reactive token so it cannot expire due to further
+    // auto-advance before the background task's double-check runs.
+    let pre_refresh = time_to_refresh.saturating_sub(Duration::from_secs(5));
+    tokio::time::advance(pre_refresh).await;
     *mock_service.next_prepare_token.lock().unwrap() = "reactive_token".to_string();
+    mock_service
+        .next_prepare_ttl_secs
+        .store(3600, std::sync::atomic::Ordering::SeqCst);
     mock_service
         .should_expire_on_execute
         .store(true, std::sync::atomic::Ordering::SeqCst);
 
-    // Execute query — reactive retry triggers and compiles reactive_token
+    // Execute query — reactive retry triggers and compiles reactive_token (TTL=3600s)
     let _stream2 = stmt
         .execute_with_retry(&mut client, std::collections::HashMap::new())
         .await
@@ -2356,11 +2379,16 @@ async fn test_proactive_refresh_pruning_after_reactive_retry() {
     let active_plan = stmt.plan_state().load_full().unwrap();
     assert_eq!(active_plan.plan_token, b"reactive_token");
 
-    // Warp to 24s (proactive task original wake-up threshold).
-    // The task must wake up, see the plan expires in the future (due to reactive compile),
-    // and exit cleanly *without* issuing any RPC!
+    // Advance past the proactive refresh threshold so the original background task
+    // wakes up. It must see reactive_token's far-future expires_at in the double-check
+    // and exit cleanly without issuing any RPC.
     tokio::time::advance(Duration::from_secs(10)).await;
-    tokio::task::yield_now().await;
+
+    // Yield multiple times to give the background task enough scheduling cycles to
+    // run through its double-check path and return before we assert the count.
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
 
     // Check prepare call count: 1 (initial) + 1 (reactive compile) = 2 total!
     // Proactive task did NOT dispatch an RPC.
@@ -2369,5 +2397,115 @@ async fn test_proactive_refresh_pruning_after_reactive_retry() {
             .prepare_call_count
             .load(std::sync::atomic::Ordering::SeqCst),
         2
+    );
+}
+
+/// Regression test for the post-RPC mark_used() fix in execute_query.
+///
+/// When an ExecuteQuery RPC is slow, the virtual clock can drift forward during the
+/// await. If last_executed_seconds is only recorded before the RPC (pre-RPC mark), the
+/// background refresh idle guard reads a timestamp that looks stale relative to the
+/// drifted clock and incorrectly skips the refresh — even though the statement is
+/// actively being used.
+///
+/// The fix records last_executed_seconds again in the Ok(resp) branch after the RPC
+/// completes, correcting for any clock drift that accumulated during the await. This
+/// test injects an execute_delay to simulate a slow network and verifies the background
+/// refresh still fires correctly via execute_query (not PreparedStatement::execute).
+#[tokio::test]
+async fn test_execute_query_slow_response_does_not_cause_idle_guard_false_positive() {
+    use googleapis_tonic_google_bigtable_v2::google;
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    let (mock_service, mut client) = start_mock_server().await;
+    tokio::time::pause();
+
+    mock_service
+        .next_prepare_ttl_secs
+        .store(30, std::sync::atomic::Ordering::SeqCst);
+
+    let mut params = std::collections::HashMap::new();
+    params.insert(
+        "id".to_string(),
+        google::bigtable::v2::Value {
+            kind: Some(google::bigtable::v2::value::Kind::IntValue(1)),
+            ..Default::default()
+        },
+    );
+
+    let request = google::bigtable::v2::ExecuteQueryRequest {
+        instance_name: client.instance_name().to_string(),
+        app_profile_id: "default".to_string(),
+        query: "SELECT * FROM table WHERE id = @id".to_string(),
+        params: params.clone(),
+        ..Default::default()
+    };
+
+    // First execute: compiles and caches the plan. No delay yet.
+    let _stream = client.execute_query(request.clone()).await.unwrap();
+    assert_eq!(
+        mock_service
+            .prepare_call_count
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+
+    // Compute the actual refresh threshold from expires_at.
+    let inner = client
+        .statement_cache()
+        .lookup_by_query("SELECT * FROM table WHERE id = @id", "default")
+        .expect("statement should be cached");
+    let expires_at = inner.plan_state.load_full().unwrap().expires_at;
+    let ttl_secs = 30u64;
+    let offset = Duration::from_secs(ttl_secs / 5);
+    let now = tokio::time::Instant::now();
+    let time_to_refresh = (expires_at - offset)
+        .checked_duration_since(now)
+        .unwrap_or_default();
+
+    // Set the next token and arm the execute delay BEFORE advancing time.
+    // The delay simulates a slow network during the second execute, which causes the
+    // virtual clock to drift forward during the await. Without the post-RPC mark_used()
+    // fix, this drift would make the idle guard treat the statement as inactive.
+    *mock_service.next_prepare_token.lock().unwrap() = "token_v2".to_string();
+    *mock_service.execute_delay.lock().unwrap() = Some(Duration::from_secs(10));
+
+    // Advance to near the refresh threshold, then execute with a slow response.
+    // The execute_delay causes virtual-clock auto-advance during the RPC await.
+    let pre_refresh = time_to_refresh.saturating_sub(Duration::from_secs(2));
+    tokio::time::advance(pre_refresh).await;
+    let _stream2 = client.execute_query(request.clone()).await.unwrap();
+    tokio::task::yield_now().await;
+
+    // Disable the execute delay and advance past the refresh threshold.
+    *mock_service.execute_delay.lock().unwrap() = None;
+    tokio::time::advance(Duration::from_secs(3)).await;
+
+    // Poll for the proactive refresh to complete and register token_v2.
+    let mut success = false;
+    for _ in 0..100 {
+        tokio::task::yield_now().await;
+        if client
+            .statement_cache()
+            .lookup_by_token(b"token_v2")
+            .is_some()
+        {
+            success = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    assert!(
+        success,
+        "background refresh must fire after a slow execute — \
+         last_executed_seconds must be updated post-RPC to correct for clock drift"
+    );
+    assert_eq!(
+        mock_service
+            .prepare_call_count
+            .load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "exactly one proactive PrepareQuery RPC expected"
     );
 }

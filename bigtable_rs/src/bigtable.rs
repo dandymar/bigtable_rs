@@ -723,7 +723,10 @@ impl BigTable {
             && request.query.is_empty()
         {
             if let Some(stmt) = self.statement_cache.lookup_by_token(&token_to_use) {
-                // Record the current time as the last-used timestamp for this statement.
+                // Record activity before the RPC so the background refresh idle guard
+                // sees this statement as active even if the execute takes time. A second
+                // update after the RPC (in the Ok branch below) corrects for any
+                // virtual-clock drift that accumulates during the await.
                 if let Some(elapsed) =
                     tokio::time::Instant::now().checked_duration_since(stmt.base_instant)
                 {
@@ -775,6 +778,18 @@ impl BigTable {
 
             match self.client.execute_query(tonic_req).await {
                 Ok(resp) => {
+                    // Record activity after the RPC completes, not before it is sent.
+                    // Any clock drift caused by I/O (real or virtual-time) happens during
+                    // the await above, so updating here gives the background refresh task
+                    // an accurate view of when this statement was last successfully used.
+                    if let Some(ref stmt) = cached_stmt {
+                        if let Some(elapsed) =
+                            tokio::time::Instant::now().checked_duration_since(stmt.base_instant)
+                        {
+                            stmt.last_executed_seconds
+                                .store(elapsed.as_secs(), std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
                     return Ok(resp.into_inner());
                 }
                 Err(status)
